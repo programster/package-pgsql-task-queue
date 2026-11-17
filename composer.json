@@ -1,0 +1,41 @@
+{
+    "name": "programster/pgsql-task-queue",
+    "type": "library",
+    "description": "A PostgreSQL task queue for PHP, with dependencies between tasks, retries, leases and batches.",
+    "keywords": ["pgsql", "postgresql", "queue", "task queue", "job queue", "worker"],
+    "homepage": "https://github.com/programster/package-pgsql-task-queue",
+    "license": "MIT",
+    "authors": [
+        {
+            "name": "Stuart Page",
+            "email": "sdpagent@gmail.com",
+            "homepage": "https://blog.programster.org",
+            "role": "Developer"
+        }
+    ],
+    "require": {
+        "php": "^8.2",
+        "ext-pgsql": "*",
+        "programster/collections": "^3.1",
+        "programster/pgsql-lib": "^3.1",
+        "programster/pgsql-migrations": "^1.2",
+        "psr/clock": "^1.0",
+        "psr/log": "^3.0"
+    },
+    "require-dev": {
+        "phpstan/phpstan": "^2.1"
+    },
+    "suggest": {
+        "ext-pcntl": "Lets a worker stop cleanly on SIGTERM and SIGINT, once it has finished the task it's on."
+    },
+    "autoload": {
+        "psr-4": {
+            "Programster\\PgsqlTaskQueue\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Programster\\PgsqlTaskQueue\\Testing\\": "testing/"
+        }
+    }
+}
