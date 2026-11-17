@@ -1,118 +1,174 @@
 # Workers
 
-- [Running workers](#running-workers)
-- [Stopping](#stopping)
+- [The worker loop](#the-worker-loop)
+- [Failures](#failures)
+- [Putting failed tasks back](#putting-failed-tasks-back)
 - [Leases](#leases)
-- [Interrupted tasks](#interrupted-tasks)
 
-## Running workers
-A worker claims a task from its queues, runs it with the handler for its class, records how it went, and repeats.
-Run as many as you like, on as many machines as can reach the database: claiming uses `FOR UPDATE SKIP LOCKED`, so no
-two workers ever get the same task, and none waits for another.
+## The worker loop
+A worker takes tasks from the queues it's given, of the types it has handlers for. Run as many as you like, on as
+many machines as can reach the database: no two ever take the same task. Each needs a connection of its own (made
+with `forceNew: true` if the process has others), as it listens for notifications on it.
 
-Each worker needs a database connection of its own (created with `forceNew: true`), as it listens for notifications
-on it, and holds transactions on it. While there's nothing to claim, it waits for a `NOTIFY` saying tasks are ready,
-so it starts on a new task straight away, and checks the queue again every `pollSeconds` (1 by default) in case one
-was missed, or a delayed task has become due.
-
-A typical worker script, run by a process manager such as supervisord, which restarts it when it stops:
+The package doesn't loop, log or handle signals itself. `runNext()` runs one task (returning false if none was ready),
+and `waitForTask()` waits until one may be ready (it's woken by `NOTIFY` when tasks are added or finish), so the loop
+is yours, e.g.:
 
 ```php
 use Programster\PgsqlLib\PgSqlConnection;
 
-final readonly class Ping implements TaskInterface
+final class ResizeImageHandler implements TaskHandlerInterface
 {
-    public static function createFromArray(array $data) : static
+    public function getType() : string
     {
-        return new Ping();
+        return 'resize-image';
     }
 
-    public function jsonSerialize() : array
+
+    public function handle(Task $task) : void
     {
-        return [];
+        if ($task->getData()['path'] === 'missing.jpg')
+        {
+            throw new RuntimeException("There's no missing.jpg.");
+        }
     }
 }
 
-final readonly class PingHandler implements TaskHandlerInterface
+/**
+ * Run tasks until told to stop, waiting when there are none.
+ * @param Worker $worker
+ * @param Closure(): bool $shouldStop
+ */
+function runWorker(Worker $worker, Closure $shouldStop) : void
 {
-    public function getTaskClass() : string
+    while (!$shouldStop())
     {
-        return Ping::class;
-    }
-
-    public function handle(TaskInterface $task, TaskContext $context) : TaskResult
-    {
-        return new TaskResult([], 'pong');
+        try
+        {
+            if (!$worker->runNext())
+            {
+                $worker->waitForTask(5);
+            }
+        }
+        catch (ExceptionTaskFailed $failure)
+        {
+            // Log it, re-enqueue it, or alert someone: the task has been removed either way.
+            error_log($failure->getMessage());
+        }
+        catch (ExceptionTasksExpired $expiry)
+        {
+            // Their workers stopped partway through them (see Leases).
+            error_log($expiry->getMessage());
+        }
     }
 }
 
-$connection = PgSqlConnection::create('localhost', 'myapp', 'myapp', 'secret', forceNew: true);
-TaskQueueSchema::migrate($connection);
-$queue = new TaskQueue($connection, new SystemClock());
-$queue->enqueue(new NewTask(new Ping(), new QueueName('default')));
+$connection = PgSqlConnection::create('localhost', 'app', 'app', 'secret');
+TaskQueue::createTables($connection);
+$queue = new TaskQueue($connection);
+$queue->enqueue(Task::create('resize-image', ['path' => 'cat.jpg'], queue: 'images', group: 'example'));
+$worker = new Worker($queue, ['images'], new ResizeImageHandler());
 
-$worker = $queue->createWorker(
-    new TaskHandlerCollection(new PingHandler()),
-    new QueueNameCollection(new QueueName('default')),
-    logger: new Psr\Log\NullLogger(), // e.g. your application's logger
-    stopConditions: new WorkerStopConditions(maxSeconds: 3600, maxMemoryBytes: 256 * 1024 * 1024, stopWhenIdle: true)
-);
+// Stop on SIGTERM (e.g. from Docker or supervisord), after the task in hand.
+$isTerminated = false;
 
-$reason = $worker->run();
-assert($reason === WorkerStopReason::IDLE);
+$terminate = function () use (&$isTerminated) : void {
+    $isTerminated = true;
+};
+
+pcntl_async_signals(true);
+pcntl_signal(SIGTERM, $terminate);
+
+// Here, also stop once the example's tasks are done, so it ends.
+$shouldStop = function () use (&$isTerminated, $queue) : bool {
+    return ($isTerminated || $queue->fetchGroup('example')->count() === 0);
+};
+
+runWorker($worker, $shouldStop);
 ```
 
-(This example stops when idle, so it finishes. A long-running worker leaves `stopWhenIdle` out.)
+## Failures
+When a handler throws, the task is removed, and `runNext()` throws `ExceptionTaskFailed`:
 
-The logger gets a line for each task: info when it succeeds or is deferred, a notice when it fails and will be
-retried, an error when it dies, and a warning if the worker lost its lease.
+- `getTask()` is the task that failed, as it was in the queue.
+- `getDependents()` is a `TaskCollection` of the tasks removed with it: those depending on it (directly, or through
+  others) whose `DependencyFailurePolicy` is `REMOVE`. Those set to `CONTINUE` are released instead, and run.
+- `getPrevious()` is what the handler threw.
 
-## Stopping
-A worker only stops between tasks, so it always finishes the task it's on first. It stops when:
-
-- it's sent SIGTERM or SIGINT (with the `pcntl` extension), e.g. when its container stops, or `stop()` is called;
-- it has run for `maxSeconds`, used more than `maxMemoryBytes`, or run `maxTasks` tasks, so a process manager starts a
-  fresh one every so often;
-- every task in `untilBatchFinished` has finished, e.g. for a test run;
-- there's nothing it can claim, with `stopWhenIdle`, e.g. to run what's due from cron and exit.
-
-`run()` returns a `WorkerStopReason` saying which. Give a process manager long enough to let the current task finish
-(e.g. supervisord's `stopwaitsecs`) before it kills the worker.
-
-## Leases
-When a worker claims a task, it gets a lease on it, for the task's `leaseSeconds` (300 by default). A task that may
-take longer extends its lease as it goes, e.g. after each item it works through:
+There are no retries, and nothing is logged: what to do is up to the application.
 
 ```php
-final readonly class LongReportHandler implements TaskHandlerInterface
+$queue->enqueue(Task::create('resize-image', ['path' => 'missing.jpg'], queue: 'images'));
+
+try
 {
-    public function getTaskClass() : string
-    {
-        return Ping::class;
-    }
-
-    public function handle(TaskInterface $task, TaskContext $context) : TaskResult
-    {
-        foreach (['january', 'february', 'march'] as $month)
-        {
-            // ... add the month to the report ...
-            $context->extendLease(300);
-        }
-
-        return new TaskResult();
-    }
+    $worker->runNext();
+}
+catch (ExceptionTaskFailed $failure)
+{
+    assert($failure->getPrevious()->getMessage() === "There's no missing.jpg.");
+    assert($failure->getDependents()->count() === 0);
 }
 ```
 
-If the lease had already run out, `extendLease()` throws `ExceptionLeaseLost`, as the task may now be running
-elsewhere. The handler should stop, as the worker won't keep its result either way.
+## Putting failed tasks back
+The tasks in an `ExceptionTaskFailed` can be enqueued again, just as they are. They're added afresh, with new IDs, and
+the dependencies among the tasks given together are linked to their new copies, so the whole set waits as before:
 
-## Interrupted tasks
-If a worker stops partway through a task without saying how it went (it was killed, or its machine lost power), the
-task's lease runs out. The next worker to look (each does before every claim, or `TaskQueue::recoverExpiredLeases()`)
-then deals with it according to its `InterruptedTaskPolicy`:
+```php
+// e.g. if it's worth another try.
+$retried = $queue->enqueue($failure->getTask(), ...$failure->getDependents()->toArray());
+assert($retried->first()->getId() !== $failure->getTask()->getId());
+$queue->delete($retried->first());
+```
 
-- `FAIL` (the default): it dies, as it may already have done what it does, e.g. sent an email or taken a payment, and
-  doing that twice is worse than not at all. Its error says why, so someone can check, and retry it if need be.
-- `RETRY`: it's run again, if it has an attempt left, for a task that's safe to run twice, e.g. one that only reads,
-  or sets something to a value.
+A dependent given back without the task it waited for is rejected (`ExceptionTaskNotFound`), as that task is gone.
+
+## Leases
+When a worker takes a task, it has the task's `leaseSeconds` to finish it. If the worker stops partway through (it's
+killed, or its machine dies), the next worker to call `runNext()` after the lease has run out removes the task, as it
+may have been partly done, so it isn't run twice. It removes every such task, one by one, each with the tasks that
+depend on it and can't continue without it (`DependencyFailurePolicy::REMOVE`). Those that can continue (`CONTINUE`)
+are left in the queue, to run.
+
+It then throws `ExceptionTasksExpired`, rather than running a task. Its `getExpiredTasks()` is an
+`ExpiredTaskCollection`, of an `ExpiredTask` for each: `getTask()` is the task whose lease ran out, and
+`getDependents()` the tasks removed because of it. Each can be put back with its dependents, if it's safe to run
+again: `$queue->enqueue($expired->getTask(), ...$expired->getDependents()->toArray())`.
+
+So give each task a lease comfortably longer than it takes, and have the handler of a task that can take a long time
+extend its lease.
+
+A handler extends its task's lease as it goes, to a number of seconds from now:
+
+```php
+final class LongExportHandler implements TaskHandlerInterface
+{
+    private TaskQueue $m_queue;
+
+
+    public function __construct(TaskQueue $queue)
+    {
+        $this->m_queue = $queue;
+    }
+
+
+    public function getType() : string
+    {
+        return 'long-export';
+    }
+
+
+    public function handle(Task $task) : void
+    {
+        foreach ([1, 2, 3] as $page)
+        {
+            // ... export a page, then make sure there's time for the next.
+            $this->m_queue->extendLease($task, 300);
+        }
+    }
+}
+
+$queue->enqueue(Task::create('long-export', [], queue: 'exports'));
+assert((new Worker($queue, ['exports'], new LongExportHandler($queue)))->runNext());
+```

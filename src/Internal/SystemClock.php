@@ -1,12 +1,14 @@
 <?php
 
 /*
- * The real time, in UTC, for a TaskQueue in an application that doesn't have a PSR-20 clock of its own.
+ * The real time, in UTC, for a TaskQueue that isn't given a clock.
+ *
+ * @internal
  */
 
 declare(strict_types = 1);
 
-namespace Programster\PgsqlTaskQueue;
+namespace Programster\PgsqlTaskQueue\Internal;
 
 
 use Psr\Clock\ClockInterface;

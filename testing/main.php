@@ -1,7 +1,7 @@
 <?php
 
 /*
- * Runs the smoke tests in testing/tests/ against a throwaway PostgreSQL database (see TestDatabase), after installing
+ * Runs the smoke tests in testing/tests/ against a throwaway PostgreSQL database (see TestDatabase), after creating
  * the queue's tables in the task_queue_test schema from scratch. This is used by run-all-php-versions.sh and
  * run-all-postgresql-versions.sh, but it can also be run directly:
  * TEST_DB_HOST=... TEST_DB_NAME=... TEST_DB_USER=... TEST_DB_PASSWORD=... php -d zend.assertions=1 testing/main.php
@@ -10,7 +10,7 @@
 
 require_once(__DIR__ . '/../vendor/autoload.php');
 
-use Programster\PgsqlTaskQueue\TaskQueueSchema;
+use Programster\PgsqlTaskQueue\TaskQueue;
 use Programster\PgsqlTaskQueue\Testing\SmokeTest;
 use Programster\PgsqlTaskQueue\Testing\TestDatabase;
 
@@ -28,7 +28,7 @@ ini_set('assert.exception', '1');
 $database = TestDatabase::get();
 $schema = TestDatabase::SCHEMA;
 $database->query("DROP SCHEMA IF EXISTS {$schema} CASCADE");
-TaskQueueSchema::migrate($database, $schema);
+TaskQueue::createTables($database, $schema);
 
 $createTestRunTable = <<<'SQL'
     DROP TABLE IF EXISTS public.test_run;
@@ -37,7 +37,6 @@ $createTestRunTable = <<<'SQL'
         id SERIAL PRIMARY KEY,
         label TEXT NOT NULL,
         worker TEXT NOT NULL,
-        attempt INT NOT NULL,
         started_at TIMESTAMPTZ NOT NULL,
         finished_at TIMESTAMPTZ NULL
     );

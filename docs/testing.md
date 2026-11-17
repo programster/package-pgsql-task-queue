@@ -3,7 +3,7 @@
 The tests are smoke tests (no PHPUnit), in `testing/tests/`, run by `testing/main.php` against a throwaway PostgreSQL
 database. They only touch the `task_queue_test` schema and a `public.test_run` table (and the docs' examples, the
 `task_queue` schema), but use a database you don't mind losing anyway. They need the `pgsql` extension, and `pcntl`
-and `posix` for the tests of stopping on SIGTERM.
+and `posix` for the tests with worker processes.
 
 With Docker, run everything the GitHub workflow runs, after `composer install`:
 
@@ -20,7 +20,7 @@ testing/run-all-postgresql-versions.sh
 testing/run-all-postgresql-versions.sh 14 18
 
 # Only the tests whose name contains some text.
-TASK_QUEUE_TEST_ONLY=dependencies testing/run-all-php-versions.sh 8.5
+TASK_QUEUE_TEST_ONLY=worker: testing/run-all-php-versions.sh 8.5
 ```
 
 Or run them directly, against a database of your own:
@@ -34,4 +34,4 @@ to run with `zend.assertions` off, so the asserts can't silently do nothing. The
 in `docs/` are run too (`testing/tests/DocsTest.php`), so the documentation can't drift from what the code does.
 
 Some tests start real worker processes (`testing/worker-process.php`): six at once on 200 dependent tasks, one killed
-with `SIGKILL` partway through a task, and an idle one woken by `NOTIFY`.
+with `SIGKILL` partway through a task (whose lease then runs out), and an idle one woken by `NOTIFY`.

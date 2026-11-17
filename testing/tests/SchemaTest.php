@@ -1,13 +1,11 @@
 <?php
 
 /*
- * Tests of installing the tables (TaskQueueSchema::migrate()), which main.php has already done once, into the
- * task_queue_test schema.
+ * Tests of creating the tables (TaskQueue::createTables() and getCreateTablesSql()), which main.php has already done
+ * once, in the task_queue_test schema.
  */
 
-use Programster\PgsqlTaskQueue\SystemClock;
 use Programster\PgsqlTaskQueue\TaskQueue;
-use Programster\PgsqlTaskQueue\TaskQueueSchema;
 use Programster\PgsqlTaskQueue\Testing\SmokeTest;
 use Programster\PgsqlTaskQueue\Testing\TestDatabase;
 
@@ -22,34 +20,31 @@ $tablesInSchema = function () : void {
         SQL;
 
     $tables = pg_fetch_all_columns(TestDatabase::get()->query($query));
-    SmokeTest::assertSame(['batch', 'migrations', 'task', 'task_dependency'], $tables, "the schema's tables");
-    $version = TestDatabase::get()->query('SELECT version FROM task_queue_test.migrations');
-    SmokeTest::assertSame('1', pg_fetch_result($version, 0, 0), "the queue's migration version");
+    SmokeTest::assertSame(['task', 'task_dependency'], $tables, "the schema's tables");
 };
 
-$smoke->run("schema: the tables and their own migration version go in the queue's schema", $tablesInSchema);
+$smoke->run("schema: the tables go in the queue's own schema", $tablesInSchema);
 
-$migrateAgain = function () : void {
-    $database = TestDatabase::get();
-    $database->query("SET search_path TO public");
-    TaskQueueSchema::migrate($database, TestDatabase::SCHEMA);
-    $searchPath = pg_fetch_result($database->query('SHOW search_path'), 0, 0);
-    SmokeTest::assertSame('public', $searchPath, "the search path, put back after migrating");
+$createAgain = function () : void {
+    TaskQueue::createTables(TestDatabase::get(), TestDatabase::SCHEMA);
+    $sql = TaskQueue::getCreateTablesSql('other_queue');
+    assert(str_contains($sql, 'CREATE TABLE IF NOT EXISTS "other_queue".task ('), "The SQL should use the schema.");
+    assert(!str_contains($sql, 'task_queue_test'), "The SQL for another schema shouldn't mention this one.");
 };
 
-$smoke->run("schema: migrating again changes nothing, and puts the search path back", $migrateAgain);
+$smoke->run("schema: creating the tables again changes nothing, and the SQL uses the schema given", $createAgain);
 
 $badSchemas = function () : void {
     foreach (['', 'Task_Queue', '1queue', 'task-queue', 'a"b', str_repeat('a', 64)] as $badSchema)
     {
-        $migrate = function () use ($badSchema) : void {
-            TaskQueueSchema::migrate(TestDatabase::get(), $badSchema);
+        $getSql = function () use ($badSchema) : void {
+            TaskQueue::getCreateTablesSql($badSchema);
         };
 
-        SmokeTest::expectException(\InvalidArgumentException::class, $migrate, "schema");
+        SmokeTest::expectException(\InvalidArgumentException::class, $getSql, "schema");
 
         $createQueue = function () use ($badSchema) : void {
-            new TaskQueue(TestDatabase::get(), new SystemClock(), $badSchema);
+            new TaskQueue(TestDatabase::get(), null, $badSchema);
         };
 
         SmokeTest::expectException(\InvalidArgumentException::class, $createQueue, "schema");

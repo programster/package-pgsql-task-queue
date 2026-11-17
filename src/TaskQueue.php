@@ -1,11 +1,12 @@
 <?php
 
 /*
- * A queue of tasks in PostgreSQL: add tasks to it (with the tasks each depends on), see how they're doing, and create
- * the workers that run them. Install its tables first, with TaskQueueSchema::migrate().
+ * A queue of tasks in PostgreSQL: add tasks to it (with the tasks each depends on), read them, and cancel them. A
+ * Worker takes them and runs them. Create its tables first, with TaskQueue::createTables() (or the SQL from
+ * getCreateTablesSql(), in the application's own migrations).
  *
- * Every time it records comes from the clock it's given, never from the database, so an application with its own
- * idea of the time (e.g. a clock it can move, for testing) gets the same idea here.
+ * A task is removed from the queue once it's been handled, or has failed, so the queue only ever holds the tasks that
+ * are still to run. Keeping a record of what was done is up to the application.
  */
 
 declare(strict_types = 1);
@@ -14,210 +15,227 @@ namespace Programster\PgsqlTaskQueue;
 
 
 use Programster\PgsqlLib\PgSqlConnection;
+use Programster\PgsqlTaskQueue\Internal\SystemClock;
 use Programster\PgsqlTaskQueue\Internal\TaskStore;
 use Psr\Clock\ClockInterface;
-use Psr\Log\LoggerInterface;
-use Psr\Log\NullLogger;
 
 
 final readonly class TaskQueue
 {
+    public const DEFAULT_SCHEMA = 'task_queue';
+
     private TaskStore $m_store;
 
 
     /**
      * @param PgSqlConnection $connection - the database the tables are in. A worker needs a connection of its own
-     * (made with forceNew: true), as it listens for notifications on it, and holds transactions on it.
+     * (made with forceNew: true), as it listens for notifications on it.
      *
-     * @param ClockInterface $clock - where every time it records comes from, e.g. a SystemClock.
+     * @param ClockInterface|null $clock - where every time it records comes from, e.g. a clock the application can
+     * move, for testing. Defaults to null, for the real time.
      *
-     * @param string $schema - the schema the tables are in, as given to TaskQueueSchema::migrate(). Defaults to
-     * "task_queue".
+     * @param string $schema - the schema the tables are in, as given to createTables(). Defaults to "task_queue".
      *
      * @throws \InvalidArgumentException - if the schema isn't 1 to 63 lowercase letters, digits and underscores.
      */
     public function __construct(
         PgSqlConnection $connection,
-        ClockInterface $clock,
-        string $schema = TaskQueueSchema::DEFAULT_SCHEMA
+        ?ClockInterface $clock = null,
+        string $schema = self::DEFAULT_SCHEMA
     )
     {
-        $this->m_store = new TaskStore($connection, $clock, $schema);
+        $this->m_store = new TaskStore($connection, $clock ?? new SystemClock(), $schema);
     }
 
 
     /**
-     * Create a batch, to put a group of tasks in (e.g. one test run), so they can be summarised and waited for
-     * together.
+     * Get the SQL that creates the schema and the queue's tables (and their indexes), for an application to run in its
+     * own migrations. Everything is created only if it doesn't exist, so it's safe to run again.
      *
-     * @param string $name - e.g. "tests 2026-11-17 10:00". 1 to 1000 characters.
+     * @param string $schema - the schema to put the tables in. Defaults to "task_queue".
      *
-     * @return Batch
+     * @return string - several statements, separated by semicolons.
+     *
+     * @throws \InvalidArgumentException - if the schema isn't 1 to 63 lowercase letters, digits and underscores.
      */
-    public function createBatch(string $name) : Batch
+    public static function getCreateTablesSql(string $schema = self::DEFAULT_SCHEMA) : string
     {
-        return $this->m_store->insertBatch($name);
+        // The schema is checked to be a plain lowercase identifier, so it's safe to quote like this.
+        TaskStore::assertValidSchema($schema);
+        $s = '"' . $schema . '"';
+
+        return <<<SQL
+            CREATE SCHEMA IF NOT EXISTS {$s};
+
+            CREATE TABLE IF NOT EXISTS {$s}.task (
+                id UUID PRIMARY KEY,
+                -- The order tasks were added in, as UUID v7s only sort by the millisecond they were made in.
+                seq BIGINT GENERATED ALWAYS AS IDENTITY UNIQUE,
+                queue TEXT NOT NULL,
+                type TEXT NOT NULL,
+                data JSONB NOT NULL,
+                group_name TEXT NULL,
+                priority INT NOT NULL,
+                num_unmet_dependencies INT NOT NULL CHECK (num_unmet_dependencies >= 0),
+                available_at TIMESTAMPTZ NOT NULL,
+                lease_seconds INT NOT NULL CHECK (lease_seconds >= 1),
+                lease_expires_at TIMESTAMPTZ NULL,
+                worker TEXT NULL,
+                on_dependency_failure TEXT NOT NULL CHECK (on_dependency_failure IN ('remove', 'continue')),
+                created_at TIMESTAMPTZ NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS {$s}.task_dependency (
+                task_id UUID NOT NULL REFERENCES {$s}.task (id) ON DELETE CASCADE,
+                depends_on_id UUID NOT NULL REFERENCES {$s}.task (id) ON DELETE CASCADE,
+                PRIMARY KEY (task_id, depends_on_id)
+            );
+
+            -- Finding the tasks that wait for one that has just finished.
+            CREATE INDEX IF NOT EXISTS task_dependency_depends_on_idx ON {$s}.task_dependency (depends_on_id);
+
+            -- Claiming the next task, which is the queue's busiest query.
+            CREATE INDEX IF NOT EXISTS task_claim_idx ON {$s}.task (queue, priority DESC, seq)
+                WHERE num_unmet_dependencies = 0 AND lease_expires_at IS NULL;
+
+            -- Finding running tasks whose lease has run out.
+            CREATE INDEX IF NOT EXISTS task_lease_idx ON {$s}.task (lease_expires_at)
+                WHERE lease_expires_at IS NOT NULL;
+
+            CREATE INDEX IF NOT EXISTS task_group_idx ON {$s}.task (group_name) WHERE group_name IS NOT NULL;
+            SQL;
     }
 
 
     /**
-     * Fetch a batch, e.g. in a worker process that's given its ID.
-     * @param int $id
-     * @return Batch
-     * @throws Exceptions\ExceptionBatchNotFound
+     * Create the schema and the queue's tables (getCreateTablesSql()), if they don't exist, e.g. when the application
+     * starts.
+     *
+     * @param PgSqlConnection $connection - the database.
+     *
+     * @param string $schema - the schema to put the tables in. Defaults to "task_queue".
+     *
+     * @return void
+     *
+     * @throws \InvalidArgumentException - if the schema isn't 1 to 63 lowercase letters, digits and underscores.
+     * @throws \Programster\PgsqlLib\Exceptions\ExceptionQueryError - if they can't be created.
      */
-    public function fetchBatch(int $id) : Batch
+    public static function createTables(PgSqlConnection $connection, string $schema = self::DEFAULT_SCHEMA) : void
     {
-        return $this->m_store->fetchBatch($id);
+        $connection->query(self::getCreateTablesSql($schema));
     }
 
 
     /**
-     * Add a task to the queue.
+     * Add tasks to the queue, all or none of them, in one transaction (or, if the connection is already in one, in a
+     * savepoint within it, so they're only added if it's committed). Each is added after the ones among them it
+     * depends on, whatever order they're given in.
      *
-     * @param NewTask $task - the task. Any task it depends on must already be in the queue (a QueuedTask).
+     * A task that was in the queue before (e.g. from an ExceptionTaskFailed) can be given back as it is: it's added
+     * afresh, with a new ID, and its dependencies on the others given with it are linked to their new copies.
      *
-     * @param Batch|null $batch - the batch to put it in. Defaults to null, for none.
+     * @param Task ...$tasks
      *
-     * @return QueuedTask - the task, as added. If its deduplication key matched an unfinished task in its queue, it's
-     * that task, and nothing was added.
+     * @return TaskCollection - the tasks, as added (with their IDs), in the order they were given.
      *
-     * @throws Exceptions\ExceptionDependencyNotQueued - if it depends on a NewTask. Use enqueueAll() for both.
-     * @throws Exceptions\ExceptionTaskNotFound - if it depends on a QueuedTask that no longer exists.
+     * @throws \LogicException - if a task depends on one that hasn't been queued, and isn't given with it.
+     * @throws Exceptions\ExceptionTaskNotFound - if a task depends on one that's no longer in the queue, in which case
+     * none of them are added.
      */
-    public function enqueue(NewTask $task, ?Batch $batch = null) : QueuedTask
+    public function enqueue(Task ...$tasks) : TaskCollection
     {
-        return $this->m_store->insertTasks(new NewTaskCollection($task), $batch)->first();
+        return $this->enqueueAll(new TaskCollection(...$tasks));
     }
 
 
     /**
-     * Add tasks to the queue, all or none of them, in one transaction. A task can depend on others among them, which
-     * are added first, whatever order they're given in.
+     * Add a collection of tasks to the queue, as one atomic operation, exactly as enqueue() does: all of them are
+     * added, or (if any can't be) none are. Build the whole set of tasks, with their dependencies on each other, and
+     * add it in one go, so a task is never linked to one that has already finished and been removed.
      *
-     * @param NewTaskCollection $tasks - the tasks.
+     * @param TaskCollection $tasks
      *
-     * @param Batch|null $batch - the batch to put them in. Defaults to null, for none.
+     * @return TaskCollection - the tasks, as added (with their IDs), in the order they were given.
      *
-     * @return QueuedTaskCollection - the tasks, as added, in the order they were given. A task whose deduplication
-     * key matched an unfinished task in its queue is that task.
-     *
-     * @throws Exceptions\ExceptionDependencyNotQueued - if one depends on a NewTask that isn't among them.
-     * @throws Exceptions\ExceptionTaskNotFound - if one depends on a QueuedTask that no longer exists.
+     * @throws \LogicException - if a task depends on one that hasn't been queued, and isn't in the collection.
+     * @throws Exceptions\ExceptionTaskNotFound - if a task depends on one that's no longer in the queue.
      */
-    public function enqueueAll(NewTaskCollection $tasks, ?Batch $batch = null) : QueuedTaskCollection
+    public function enqueueAll(TaskCollection $tasks) : TaskCollection
     {
-        return $this->m_store->insertTasks($tasks, $batch);
-    }
-
-
-    /**
-     * Create a worker, to run tasks from some of the queues, e.g. in a long-running process of its own.
-     *
-     * @param TaskHandlerCollection $handlers - a handler for each class of task it runs. It only claims tasks of
-     * these classes.
-     *
-     * @param QueueNameCollection $queues - the queues it takes tasks from.
-     *
-     * @param LoggerInterface $logger - where it logs each task's outcome. Defaults to none.
-     *
-     * @param WorkerStopConditions $stopConditions - when it stops by itself. Defaults to never.
-     *
-     * @param float $pollSeconds - the longest it waits for a notification before checking the queue again, from 0.01
-     * to 3600. Defaults to 1.
-     *
-     * @return Worker
-     *
-     * @throws \InvalidArgumentException - if there are no handlers or queues, two handlers handle the same class of
-     * task, or the poll time is out of range.
-     */
-    public function createWorker(
-        TaskHandlerCollection $handlers,
-        QueueNameCollection $queues,
-        LoggerInterface $logger = new NullLogger(),
-        WorkerStopConditions $stopConditions = new WorkerStopConditions(),
-        float $pollSeconds = 1.0
-    ) : Worker
-    {
-        return new Worker($this->m_store, $handlers, $queues, $logger, $stopConditions, $pollSeconds);
+        return $this->m_store->insertTasks($tasks);
     }
 
 
     /**
      * Fetch a task, as it is now.
-     * @param int $id
-     * @return QueuedTask
-     * @throws Exceptions\ExceptionTaskNotFound
+     *
+     * @param string $id - its ID, a UUID.
+     *
+     * @return Task
+     *
+     * @throws Exceptions\ExceptionTaskNotFound - if it isn't in the queue (e.g. it's been handled), or $id isn't a
+     * UUID.
      */
-    public function fetchTask(int $id) : QueuedTask
+    public function fetch(string $id) : Task
     {
-        return $this->m_store->fetchTask($id);
+        return $this->m_store->fetch($id);
     }
 
 
     /**
-     * Fetch a batch's tasks, and how they stand.
-     * @param Batch $batch
-     * @return BatchSummary
+     * Fetch the tasks still in the queue in a group, oldest first, e.g. to see whether a test run has finished (when
+     * there are none left).
+     * @param string $group
+     * @return TaskCollection
      */
-    public function fetchBatchSummary(Batch $batch) : BatchSummary
+    public function fetchGroup(string $group) : TaskCollection
     {
-        return new BatchSummary($batch, $this->m_store->fetchTasksInBatch($batch));
+        return $this->m_store->fetchGroup($group);
     }
 
 
     /**
-     * Fetch a page of the tasks in a queue with a status, newest first, e.g. for an admin page.
-     * @param TaskStatus $status
-     * @param QueueName $queue
-     * @param int $limit - the most to fetch, at least 1.
-     * @param int $offset - how many to skip, at least 0. Defaults to 0.
-     * @return QueuedTaskCollection
+     * Remove a task that hasn't run yet (or is running) from the queue, as if it had failed: the tasks that depend on
+     * it follow their DependencyFailurePolicy.
+     *
+     * @param Task $task
+     *
+     * @return TaskCollection - the tasks removed with it, as they were in the queue.
+     *
+     * @throws Exceptions\ExceptionTaskNotFound - if it isn't in the queue.
      */
-    public function fetchPage(TaskStatus $status, QueueName $queue, int $limit, int $offset = 0) : QueuedTaskCollection
+    public function delete(Task $task) : TaskCollection
     {
-        return $this->m_store->fetchPage($status, $queue, $limit, $offset);
+        return $this->m_store->removeFailed($task);
     }
 
 
     /**
-     * Retry a dead task from the start, with all its attempts, e.g. from an admin page. The tasks that were skipped
-     * because it died are un-skipped, so they run once it succeeds.
+     * Extend a running task's lease, to the given number of seconds from now, so it isn't treated as having failed
+     * while it's still running. A handler of a long task calls it every so often.
      *
-     * @param int $id
+     * @param Task $task - the task being run.
      *
-     * @throws Exceptions\ExceptionTaskNotFound
-     * @throws Exceptions\ExceptionCantRetryTask - if it hasn't died.
+     * @param int $seconds - from 1 to 86400 (a day).
+     *
+     * @return void
+     *
+     * @throws \InvalidArgumentException - if the seconds are out of range.
+     * @throws Exceptions\ExceptionTaskNotFound - if it isn't running, e.g. its lease had already run out.
      */
-    public function retry(int $id) : void
+    public function extendLease(Task $task, int $seconds) : void
     {
-        $this->m_store->retry($id);
+        $this->m_store->extendLease($task, $seconds);
     }
 
 
     /**
-     * Deal with every running task whose lease has run out, as its worker must have stopped partway through it,
-     * retrying or failing each according to its InterruptedTaskPolicy. Workers do this before each claim, so it's
-     * only needed when no worker is running.
-     *
-     * @return int - how many there were.
+     * Get the store the queue's workers use.
+     * @internal - for Worker.
+     * @return TaskStore
      */
-    public function recoverExpiredLeases() : int
+    public function getStore() : TaskStore
     {
-        return $this->m_store->recoverExpiredLeases();
-    }
-
-
-    /**
-     * Delete the tasks that finished (succeeded, died or were skipped) before a time, e.g. a month ago, and the
-     * batches made before then that have no tasks left, so the tables don't grow forever.
-     *
-     * @param \DateTimeInterface $before
-     *
-     * @return int - how many tasks were deleted.
-     */
-    public function deleteFinishedBefore(\DateTimeInterface $before) : int
-    {
-        return $this->m_store->deleteFinishedBefore($before);
+        return $this->m_store;
     }
 }

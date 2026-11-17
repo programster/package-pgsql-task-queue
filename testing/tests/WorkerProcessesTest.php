@@ -1,37 +1,29 @@
 <?php
 
 /*
- * Tests with real worker processes (testing/worker-process.php), using the real clock: several workers on one batch
- * never run a task twice and respect its dependencies, a worker killed partway through a task has it recovered once
- * its lease runs out, and an idle worker starts on a new task as soon as it's added, rather than at its next poll.
+ * Tests with real worker processes (testing/worker-process.php), using the real clock: several workers on one group
+ * never run a task twice and keep to its dependencies, a task whose worker is killed partway through is removed once
+ * its lease runs out, and an idle worker starts on a new task as soon as it's added, rather than when its wait is up.
  */
 
-use Programster\PgsqlTaskQueue\InterruptedTaskPolicy;
-use Programster\PgsqlTaskQueue\NewTask;
-use Programster\PgsqlTaskQueue\NewTaskCollection;
-use Programster\PgsqlTaskQueue\QueueName;
-use Programster\PgsqlTaskQueue\RetrySchedule;
-use Programster\PgsqlTaskQueue\SystemClock;
-use Programster\PgsqlTaskQueue\TaskOptions;
+use Programster\PgsqlTaskQueue\TaskCollection;
 use Programster\PgsqlTaskQueue\TaskQueue;
-use Programster\PgsqlTaskQueue\TaskStatus;
-use Programster\PgsqlTaskQueue\Testing\Fixtures;
 use Programster\PgsqlTaskQueue\Testing\SmokeTest;
 use Programster\PgsqlTaskQueue\Testing\TestDatabase;
-use Programster\PgsqlTaskQueue\Testing\TestTask;
-use Programster\PgsqlTaskQueue\Testing\TestTaskBehaviour;
+use Programster\PgsqlTaskQueue\Testing\TestHandler;
 
 /**
- * Start a worker process on a batch, with its output kept in a temporary file.
- * @param int $batchId
- * @param float $pollSeconds
+ * Start a worker process on a group.
+ * @param string $group
+ * @param float $waitSeconds
  * @return array{process: resource, pid: int}
  */
-function startWorkerProcess(int $batchId, float $pollSeconds) : array
+function startWorkerProcess(string $group, float $waitSeconds) : array
 {
-    $command = [PHP_BINARY, '-d', 'zend.assertions=1', __DIR__ . '/../worker-process.php', $batchId, $pollSeconds];
+    $script = __DIR__ . '/../worker-process.php';
+    $command = [PHP_BINARY, '-d', 'zend.assertions=1', $script, $group, (string)$waitSeconds];
     $descriptors = [0 => ['file', '/dev/null', 'r'], 1 => ['file', '/dev/null', 'w'], 2 => ['file', '/dev/null', 'w']];
-    $process = proc_open(array_map('strval', $command), $descriptors, $pipes);
+    $process = proc_open($command, $descriptors, $pipes);
     assert(is_resource($process), "The worker process should start.");
     return ['process' => $process, 'pid' => proc_get_status($process)['pid']];
 }
@@ -92,30 +84,28 @@ function fetchCount(string $query) : int
 
 $manyWorkers = function () : void {
     TestDatabase::reset();
-    $queue = new TaskQueue(TestDatabase::get(), new SystemClock(), TestDatabase::SCHEMA);
-    $batch = $queue->createBatch('many workers');
+    $queue = new TaskQueue(TestDatabase::get(), null, TestDatabase::SCHEMA);
     $tasks = [];
 
     // 40 chains of 5 tasks, each depending on the one before it in its chain.
     for ($chain = 1; $chain <= 40; $chain++)
     {
-        $previous = null;
+        $dependsOn = new TaskCollection();
 
         for ($link = 1; $link <= 5; $link++)
         {
-            $dependencies = ($previous === null) ? [] : [$previous];
-            $task = new TestTask("{$chain}.{$link}", TestTaskBehaviour::RECORD, 5);
-            $previous = new NewTask($task, new QueueName(Fixtures::QUEUE), new TaskOptions(), ...$dependencies);
-            $tasks[] = $previous;
+            $task = TestHandler::createTask("{$chain}.{$link}", 'record', $dependsOn, group: 'many', sleepMs: 5);
+            $dependsOn = new TaskCollection($task);
+            $tasks[] = $task;
         }
     }
 
-    $queue->enqueueAll(new NewTaskCollection(...$tasks), $batch);
+    $queue->enqueue(...$tasks);
     $workers = [];
 
     for ($i = 0; $i < 6; $i++)
     {
-        $workers[] = startWorkerProcess($batch->getId(), 1);
+        $workers[] = startWorkerProcess('many', 1);
     }
 
     foreach ($workers as $worker)
@@ -123,8 +113,7 @@ $manyWorkers = function () : void {
         waitForWorkerProcess($worker, 60);
     }
 
-    $summary = $queue->fetchBatchSummary($batch);
-    SmokeTest::assertSame(200, $summary->countWithStatus(TaskStatus::SUCCEEDED), "tasks that succeeded");
+    SmokeTest::assertSame(0, TestDatabase::countTasks(), "the tasks left");
     SmokeTest::assertSame(200, fetchCount("SELECT count(*) FROM public.test_run"), "times a task was run");
     SmokeTest::assertSame(200, fetchCount("SELECT count(DISTINCT label) FROM public.test_run"), "tasks run");
     assert(fetchCount("SELECT count(DISTINCT worker) FROM public.test_run") > 1, "More than one worker ran tasks.");
@@ -144,74 +133,48 @@ $manyWorkers = function () : void {
 $smoke->run("processes: six workers on 200 dependent tasks run each once, in dependency order", $manyWorkers);
 
 $killedWorker = function () : void {
-    foreach ([InterruptedTaskPolicy::RETRY, InterruptedTaskPolicy::FAIL] as $policy)
-    {
-        TestDatabase::reset();
-        $queue = new TaskQueue(TestDatabase::get(), new SystemClock(), TestDatabase::SCHEMA);
-        $batch = $queue->createBatch("killed worker, {$policy->value}");
+    TestDatabase::reset();
+    $queue = new TaskQueue(TestDatabase::get(), null, TestDatabase::SCHEMA);
+    $hangs = TestHandler::createTask('hangs', 'hang', group: 'killed', leaseSeconds: 2);
+    $dependent = TestHandler::createTask('dependent', 'record', new TaskCollection($hangs), group: 'killed');
+    $queue->enqueue($hangs, $dependent);
+    $first = startWorkerProcess('killed', 0.2);
 
-        $options = new TaskOptions(
-            retrySchedule: RetrySchedule::createUsingDelaysInSeconds(1),
-            onInterruption: $policy,
-            leaseSeconds: 2
-        );
+    $hasStarted = function () : bool {
+        return (fetchCount("SELECT count(*) FROM public.test_run") === 1);
+    };
 
-        $task = $queue->enqueue(Fixtures::createTask('hangs', TestTaskBehaviour::HANG, $options), $batch);
-        $first = startWorkerProcess($batch->getId(), 0.2);
+    waitUntil($hasStarted, 10, "the task to start");
+    posix_kill($first['pid'], SIGKILL);
+    waitForWorkerProcess($first, 10);
 
-        $hasStarted = function () : bool {
-            return (fetchCount("SELECT count(*) FROM public.test_run") === 1);
-        };
-
-        waitUntil($hasStarted, 10, "the task to start");
-        posix_kill($first['pid'], SIGKILL);
-        waitForWorkerProcess($first, 10);
-
-        // Make the retry finish quickly, rather than hanging again.
-        $recordPayload = '{"label": "hangs", "behaviour": "record", "sleepMs": 0}';
-        $update = 'UPDATE task_queue_test.task SET payload = $1 WHERE id = $2';
-        TestDatabase::get()->query($update, [$recordPayload, $task->getId()]);
-
-        $second = startWorkerProcess($batch->getId(), 0.2);
-        waitForWorkerProcess($second, 20);
-        $recovered = $queue->fetchTask($task->getId());
-
-        if ($policy === InterruptedTaskPolicy::RETRY)
-        {
-            SmokeTest::assertSame(TaskStatus::SUCCEEDED, $recovered->getStatus(), "the retried task's status");
-            SmokeTest::assertSame(2, $recovered->getAttempts(), "attempts, including the interrupted one");
-            SmokeTest::assertSame(2, fetchCount("SELECT count(DISTINCT worker) FROM public.test_run"), "workers");
-        }
-        else
-        {
-            SmokeTest::assertSame(TaskStatus::DEAD, $recovered->getStatus(), "the failed task's status");
-            assert(str_contains((string)$recovered->getError(), "may already have done"), "Why it failed is kept.");
-            SmokeTest::assertSame(1, fetchCount("SELECT count(*) FROM public.test_run"), "times it ran");
-        }
-    }
+    // The next worker removes it once its lease is up (and throws), with its dependent, so the group empties and it
+    // stops.
+    $second = startWorkerProcess('killed', 0.2);
+    waitForWorkerProcess($second, 20);
+    SmokeTest::assertSame(0, TestDatabase::countTasks(), "the tasks left");
+    SmokeTest::assertSame(1, fetchCount("SELECT count(*) FROM public.test_run"), "the tasks that ran");
 };
 
-$smoke->run("processes: a task whose worker was killed is retried or failed, by its policy", $killedWorker);
+$smoke->run("processes: a task whose worker was killed is removed, with its dependents, in time", $killedWorker);
 
 $notifyWakesWorker = function () : void {
     TestDatabase::reset();
-    $queue = new TaskQueue(TestDatabase::get(), new SystemClock(), TestDatabase::SCHEMA);
-    $batch = $queue->createBatch('notify');
+    $queue = new TaskQueue(TestDatabase::get(), null, TestDatabase::SCHEMA);
 
-    // A task that isn't due for a day keeps the batch unfinished, so the worker waits.
-    $later = (new SystemClock())->now()->modify('+1 day');
-    $queue->enqueue(Fixtures::createTask('tomorrow', options: new TaskOptions(notBefore: $later)), $batch);
-    $worker = startWorkerProcess($batch->getId(), 30);
+    // A task that isn't due for a day keeps the group from emptying, so the worker waits.
+    $tomorrow = new \DateTimeImmutable('+1 day');
+    $queue->enqueue(TestHandler::createTask('tomorrow', group: 'notify', notBefore: $tomorrow));
+    $worker = startWorkerProcess('notify', 30);
     usleep(500000);
-    $now = new NewTask(new TestTask('now', TestTaskBehaviour::RECORD), new QueueName(Fixtures::QUEUE));
-    $queue->enqueue($now, $batch);
+    $queue->enqueue(TestHandler::createTask('now', 'record', group: 'notify'));
 
     $hasRun = function () : bool {
         return (fetchCount("SELECT count(*) FROM public.test_run WHERE finished_at IS NOT NULL") === 1);
     };
 
     $seconds = waitUntil($hasRun, 10, "the new task to run");
-    assert($seconds < 5, "The worker should start on it straight away, not at its next poll, in 30 seconds.");
+    assert($seconds < 5, "The worker should start on it straight away, not when its 30 second wait is up.");
     posix_kill($worker['pid'], SIGTERM);
     waitForWorkerProcess($worker, 10);
 };

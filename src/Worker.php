@@ -1,17 +1,30 @@
 <?php
 
 /*
- * Claims tasks from its queues, one at a time, runs each with the handler for its class, and records how it went,
- * until one of its stop conditions is met, or it's told to stop. Run as many as you like, on as many machines as can
- * reach the database: no two ever claim the same task. Created by TaskQueue::createWorker().
+ * Takes tasks from its queues, one at a time (runNext()), and runs each with the handler for its type. Run as many as
+ * you like, on as many machines as can reach the database: no two ever take the same task. Each needs a database
+ * connection of its own, as it listens for notifications on it (waitForTask()).
  *
- * While there's nothing to claim, it waits for the database to say tasks are ready (LISTEN/NOTIFY), so it starts on
- * a task as soon as it's added, checking again every so often in case a notification was missed.
+ * It doesn't loop, log, or handle signals itself, so the application can do those however it likes, e.g.:
  *
- * Before each claim, it deals with any task whose lease has run out (its worker stopped partway through it), retrying
- * or failing it according to its InterruptedTaskPolicy.
- *
- * With the pcntl extension, SIGTERM and SIGINT make it stop once it has finished the task it's on.
+ *     while (!$shouldStop)
+ *     {
+ *         try
+ *         {
+ *             if (!$worker->runNext())
+ *             {
+ *                 $worker->waitForTask(1);
+ *             }
+ *         }
+ *         catch (ExceptionTaskFailed $failure)
+ *         {
+ *             // e.g. log it, or re-enqueue the task and its dependents.
+ *         }
+ *         catch (ExceptionTasksExpired $expiry)
+ *         {
+ *             // e.g. log them: their workers stopped partway through them.
+ *         }
+ *     }
  */
 
 declare(strict_types = 1);
@@ -19,370 +32,131 @@ declare(strict_types = 1);
 namespace Programster\PgsqlTaskQueue;
 
 
-use Programster\PgsqlTaskQueue\Exceptions\ExceptionLeaseLost;
-use Programster\PgsqlTaskQueue\Exceptions\ExceptionTaskDeferred;
-use Programster\PgsqlTaskQueue\Exceptions\ExceptionTaskFailedPermanently;
-use Programster\PgsqlTaskQueue\Internal\ClaimedTask;
+use Programster\PgsqlTaskQueue\Exceptions\ExceptionTaskFailed;
+use Programster\PgsqlTaskQueue\Exceptions\ExceptionTasksExpired;
+use Programster\PgsqlTaskQueue\Internal\TaskHandlerMap;
 use Programster\PgsqlTaskQueue\Internal\TaskStore;
-use Psr\Log\LoggerInterface;
 
 
 final class Worker
 {
     private readonly TaskStore $m_store;
-    private readonly TaskHandlerCollection $m_handlers;
-    private readonly QueueNameCollection $m_queues;
-    private readonly LoggerInterface $m_logger;
-    private readonly WorkerStopConditions $m_stopConditions;
-    private readonly float $m_pollSeconds;
-    private readonly string $m_name;
 
     /** @var list<string> */
-    private readonly array $m_taskClasses;
+    private readonly array $m_queues;
 
-    // Set by stop(), or by SIGTERM or SIGINT, and checked between tasks.
-    private bool $m_shouldStop = false;
+    // Each handler, by the type it handles.
+    private readonly TaskHandlerMap $m_handlersByType;
 
-
-    /**
-     * @internal - use TaskQueue::createWorker().
-     *
-     * @param TaskStore $store
-     *
-     * @param TaskHandlerCollection $handlers - a handler for each class of task it runs.
-     *
-     * @param QueueNameCollection $queues - the queues it takes tasks from.
-     *
-     * @param LoggerInterface $logger
-     *
-     * @param WorkerStopConditions $stopConditions
-     *
-     * @param float $pollSeconds - the longest it waits for a notification before checking the queue again.
-     *
-     * @throws \InvalidArgumentException - if there are no handlers or queues, two handlers handle the same class, a
-     * handler's class isn't a TaskInterface, or the poll time is out of range.
-     */
-    public function __construct(
-        TaskStore $store,
-        TaskHandlerCollection $handlers,
-        QueueNameCollection $queues,
-        LoggerInterface $logger,
-        WorkerStopConditions $stopConditions,
-        float $pollSeconds
-    )
-    {
-        if ($handlers->count() === 0 || $queues->count() === 0)
-        {
-            throw new \InvalidArgumentException("A worker needs at least one handler and at least one queue.");
-        }
-
-        if ($pollSeconds < 0.01 || $pollSeconds > 3600)
-        {
-            throw new \InvalidArgumentException("A worker's poll time must be from 0.01 to 3600 seconds.");
-        }
-
-        $this->m_store = $store;
-        $this->m_handlers = $handlers;
-        $this->m_queues = $queues;
-        $this->m_logger = $logger;
-        $this->m_stopConditions = $stopConditions;
-        $this->m_pollSeconds = $pollSeconds;
-        $this->m_name = sprintf('%s:%d:%s', gethostname(), getmypid(), bin2hex(random_bytes(4)));
-        $this->m_taskClasses = self::findTaskClasses($handlers);
-    }
+    private readonly string $m_name;
+    private bool $m_isListening = false;
 
 
     /**
-     * Run tasks until a stop condition is met, or the worker is told to stop.
-     * @return WorkerStopReason - why it stopped.
+     * @param TaskQueue $queue - the queue to take tasks from.
+     *
+     * @param array<mixed> $queues - the names of the queues it takes tasks from, e.g. ["emails"].
+     *
+     * @param TaskHandlerInterface ...$handlers - a handler for each type of task it runs. It only takes tasks of those
+     * types.
+     *
+     * @throws \InvalidArgumentException - if there are no queues or handlers, a queue name is empty, or two handlers
+     * handle the same type.
      */
-    public function run() : WorkerStopReason
+    public function __construct(TaskQueue $queue, array $queues, TaskHandlerInterface ...$handlers)
     {
-        $this->m_shouldStop = false;
-        $restoreSignalHandlers = $this->installSignalHandlers();
-        $this->m_store->listen();
-        $startedAt = hrtime(true);
-        $numTasks = 0;
-        $reason = null;
-
-        try
+        if (count($queues) === 0 || count($handlers) === 0)
         {
-            while ($reason === null)
+            throw new \InvalidArgumentException("A worker needs at least one queue and at least one handler.");
+        }
+
+        $queueNames = [];
+
+        foreach ($queues as $name)
+        {
+            if (!is_string($name) || trim($name) === '')
             {
-                $reason = $this->findStopReason($startedAt, $numTasks);
-
-                if ($reason === null)
-                {
-                    $this->m_store->recoverExpiredLeases();
-                    $claimed = $this->m_store->claimNext($this->m_queues, $this->m_taskClasses, $this->m_name);
-
-                    if ($claimed === null && $this->m_stopConditions->getStopWhenIdle())
-                    {
-                        $reason = WorkerStopReason::IDLE;
-                    }
-                    elseif ($claimed === null)
-                    {
-                        $this->m_store->waitForNotification($this->m_pollSeconds);
-                    }
-                    else
-                    {
-                        $this->runClaimed($claimed);
-                        $numTasks++;
-                    }
-                }
+                throw new \InvalidArgumentException("Each of a worker's queues must be a name, not an empty one.");
             }
-        }
-        finally
-        {
-            $this->m_store->unlisten();
-            $restoreSignalHandlers();
+
+            $queueNames[] = $name;
         }
 
-        $this->m_logger->info("Worker {$this->m_name} stopped ({$reason->value}) after {$numTasks} tasks.");
-        return $reason;
-    }
-
-
-    /**
-     * Stop once the task being run (if any) has finished, e.g. from a handler, or a signal handler of your own.
-     */
-    public function stop() : void
-    {
-        $this->m_shouldStop = true;
-    }
-
-
-    /**
-     * Run a claimed task, and record how it went, unless the worker lost it (its lease ran out) in the meantime.
-     * @param ClaimedTask $claimed
-     */
-    private function runClaimed(ClaimedTask $claimed) : void
-    {
-        try
-        {
-            $this->runAndRecord($claimed);
-        }
-        catch (ExceptionLeaseLost $exception)
-        {
-            $this->m_logger->warning($exception->getMessage());
-        }
-    }
-
-
-    /**
-     * @param ClaimedTask $claimed
-     * @throws ExceptionLeaseLost - if the worker no longer holds the task.
-     */
-    private function runAndRecord(ClaimedTask $claimed) : void
-    {
-        $queued = $claimed->getTask();
-        $label = self::describe($queued);
-        $startedAt = hrtime(true);
-
-        try
-        {
-            $handler = $this->findHandler($queued->getTaskClass());
-            $result = $handler->handle($queued->getTask(), new TaskContext($this->m_store, $claimed));
-            $this->m_store->markSucceeded($claimed, $result, self::getMillisecondsSince($startedAt));
-            $this->m_logger->info("{$label} succeeded.");
-        }
-        catch (ExceptionLeaseLost $exception)
-        {
-            throw $exception;
-        }
-        catch (ExceptionTaskDeferred $exception)
-        {
-            $this->m_store->markDeferred($claimed, $exception->getUntil(), $exception->getMessage());
-            $until = $exception->getUntil()->format(\DateTimeInterface::ATOM);
-            $this->m_logger->info("{$label} was deferred until {$until}: {$exception->getMessage()}");
-        }
-        catch (ExceptionTaskFailedPermanently $exception)
-        {
-            $this->recordFailure($claimed, $exception, true, $startedAt);
-        }
-        catch (\Throwable $exception)
-        {
-            $this->recordFailure($claimed, $exception, false, $startedAt);
-        }
-    }
-
-
-    /**
-     * @param ClaimedTask $claimed
-     * @param \Throwable $exception - what the handler threw.
-     * @param bool $isPermanent
-     * @param int|float $startedAt - when it started, from hrtime(true).
-     * @throws ExceptionLeaseLost
-     */
-    private function recordFailure(
-        ClaimedTask $claimed,
-        \Throwable $exception,
-        bool $isPermanent,
-        int|float $startedAt
-    ) : void
-    {
-        $where = "{$exception->getFile()}:{$exception->getLine()}";
-        $error = get_class($exception) . ": {$exception->getMessage()} @ {$where}";
-        $durationMs = self::getMillisecondsSince($startedAt);
-        $status = $this->m_store->markFailed($claimed, $error, $isPermanent, $durationMs);
-        $label = self::describe($claimed->getTask());
-
-        if ($status === TaskStatus::WAITING)
-        {
-            $this->m_logger->notice("{$label} failed, and will be retried: {$error}");
-        }
-        else
-        {
-            $this->m_logger->error("{$label} died: {$error}");
-        }
-    }
-
-
-    /**
-     * @param int|float $startedAt - when it started, from hrtime(true).
-     * @return ?WorkerStopReason - why the worker should stop, or null to carry on.
-     */
-    private function findStopReason(int|float $startedAt, int $numTasks) : ?WorkerStopReason
-    {
-        $conditions = $this->m_stopConditions;
-        $maxSeconds = $conditions->getMaxSeconds();
-        $maxMemoryBytes = $conditions->getMaxMemoryBytes();
-        $maxTasks = $conditions->getMaxTasks();
-        $batch = $conditions->getUntilBatchFinished();
-
-        if ($this->m_shouldStop)
-        {
-            $reason = WorkerStopReason::STOPPED;
-        }
-        elseif ($maxSeconds !== null && self::getMillisecondsSince($startedAt) >= $maxSeconds * 1000)
-        {
-            $reason = WorkerStopReason::TIME_LIMIT;
-        }
-        elseif ($maxMemoryBytes !== null && memory_get_usage(true) > $maxMemoryBytes)
-        {
-            $reason = WorkerStopReason::MEMORY_LIMIT;
-        }
-        elseif ($maxTasks !== null && $numTasks >= $maxTasks)
-        {
-            $reason = WorkerStopReason::TASK_LIMIT;
-        }
-        elseif ($batch !== null && $this->m_store->isBatchFinished($batch))
-        {
-            $reason = WorkerStopReason::BATCH_FINISHED;
-        }
-        else
-        {
-            $reason = null;
-        }
-
-        return $reason;
-    }
-
-
-    /**
-     * Make SIGTERM and SIGINT stop the worker between tasks, if the pcntl extension is loaded.
-     * @return \Closure(): void - puts back the handlers there were before.
-     */
-    private function installSignalHandlers() : \Closure
-    {
-        if (function_exists('pcntl_async_signals'))
-        {
-            $wasAsync = pcntl_async_signals(true);
-            $previousTerm = pcntl_signal_get_handler(SIGTERM);
-            $previousInt = pcntl_signal_get_handler(SIGINT);
-
-            $stopWorker = function () : void {
-                $this->m_shouldStop = true;
-            };
-
-            pcntl_signal(SIGTERM, $stopWorker);
-            pcntl_signal(SIGINT, $stopWorker);
-
-            $restore = function () use ($wasAsync, $previousTerm, $previousInt) : void {
-                pcntl_signal(SIGTERM, $previousTerm);
-                pcntl_signal(SIGINT, $previousInt);
-                pcntl_async_signals($wasAsync);
-            };
-        }
-        else
-        {
-            $restore = function () : void {
-                // There was nothing to put back.
-            };
-        }
-
-        return $restore;
-    }
-
-
-    /**
-     * @param class-string<TaskInterface> $taskClass
-     * @return TaskHandlerInterface
-     * @throws \LogicException - if there's none, which can't happen, as the worker only claims tasks it can handle.
-     */
-    private function findHandler(string $taskClass) : TaskHandlerInterface
-    {
-        $isForClass = function (TaskHandlerInterface $handler) use ($taskClass) : bool {
-            return ($handler->getTaskClass() === $taskClass);
-        };
-
-        $found = $this->m_handlers->filter($isForClass);
-
-        if ($found->count() !== 1)
-        {
-            throw new \LogicException("Worker {$this->m_name} has no handler for {$taskClass}.");
-        }
-
-        return $found->first();
-    }
-
-
-    /**
-     * Get the class of task each handler handles, checking each is a TaskInterface, handled only once.
-     * @param TaskHandlerCollection $handlers
-     * @return list<string>
-     * @throws \InvalidArgumentException
-     */
-    private static function findTaskClasses(TaskHandlerCollection $handlers) : array
-    {
-        $classes = [];
+        $handlersByType = [];
 
         foreach ($handlers as $handler)
         {
-            $class = $handler->getTaskClass();
-            $handlerClass = get_class($handler);
-
-            if (!is_subclass_of($class, TaskInterface::class))
+            if (isset($handlersByType[$handler->getType()]))
             {
-                throw new \InvalidArgumentException("{$handlerClass} handles {$class}, which isn't a TaskInterface.");
+                throw new \InvalidArgumentException("Two handlers handle the {$handler->getType()} type of task.");
             }
 
-            if (in_array($class, $classes, true))
-            {
-                throw new \InvalidArgumentException("More than one handler handles {$class}, as {$handlerClass} does.");
-            }
-
-            $classes[] = $class;
+            $handlersByType[$handler->getType()] = $handler;
         }
 
-        return $classes;
-    }
-
-
-    private static function describe(QueuedTask $task) : string
-    {
-        $named = ($task->getName() === null) ? "" : " ({$task->getName()})";
-        return "Task {$task->getId()}{$named}, attempt {$task->getAttempts()} of {$task->getMaxAttempts()},";
+        $this->m_store = $queue->getStore();
+        $this->m_queues = $queueNames;
+        $this->m_handlersByType = new TaskHandlerMap(...$handlersByType);
+        $this->m_name = sprintf('%s:%d:%s', gethostname(), getmypid(), bin2hex(random_bytes(4)));
     }
 
 
     /**
-     * @param int|float $startedAt - from hrtime(true).
-     * @return int
+     * Take the next task that's ready, from the worker's queues, of a type it has a handler for, and run it. Once it
+     * succeeds, it's removed from the queue, and the tasks waiting for it are released.
+     *
+     * First, though, it removes every running task whose lease has run out (its worker must have stopped partway
+     * through it), with the tasks that depend on it, as each one's DependencyFailurePolicy says. If there were any, it
+     * throws, with them all, rather than going on to run a task.
+     *
+     * @return bool - whether it ran a task (false when there was none ready).
+     *
+     * @throws ExceptionTasksExpired - if tasks' leases had run out: they've been removed, with their dependents that
+     * couldn't continue without them, and are all in the exception. Nothing was run, so call it again to carry on.
+     *
+     * @throws ExceptionTaskFailed - if the task's handler threw: the task has been removed, with the tasks that
+     * depended on it whose policy is to be removed too. All are in the exception.
      */
-    private static function getMillisecondsSince(int|float $startedAt) : int
+    public function runNext() : bool
     {
-        return (int)round((hrtime(true) - $startedAt) / 1000000);
+        $this->m_store->removeAllExpired();
+        $claimed = $this->m_store->claimNext($this->m_queues, $this->m_handlersByType->keys(), $this->m_name);
+
+        foreach ($claimed as $task)
+        {
+            try
+            {
+                $this->m_handlersByType->get($task->getType())->handle($task);
+            }
+            catch (\Throwable $cause)
+            {
+                throw new ExceptionTaskFailed($task, $this->m_store->removeFailed($task), $cause);
+            }
+
+            $this->m_store->complete($task, $this->m_name);
+        }
+
+        return !$claimed->isEmpty();
+    }
+
+
+    /**
+     * Wait until a task may be ready (the database says tasks were added or finished), or the time is up, whichever is
+     * first, e.g. after runNext() found nothing to do. It returns early if the process is sent a signal.
+     *
+     * @param float $seconds - the longest to wait.
+     *
+     * @return void
+     */
+    public function waitForTask(float $seconds) : void
+    {
+        if (!$this->m_isListening)
+        {
+            $this->m_store->listen();
+            $this->m_isListening = true;
+        }
+
+        $this->m_store->waitForNotification($seconds);
     }
 
 

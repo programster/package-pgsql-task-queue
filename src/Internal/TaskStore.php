@@ -1,14 +1,14 @@
 <?php
 
 /*
- * Every query the queue and its workers run against the task tables, in one place. Each change of a task's status,
- * and what follows from it (releasing or skipping the tasks that depend on it), happens in one transaction, so
- * another worker never sees it half done.
+ * Every query the queue and its workers run against the task tables, in one place. Each change that has knock-on
+ * effects (a task finishing releases or removes the tasks that depend on it) happens in one transaction, so another
+ * worker never sees it half done.
  *
  * Times always come from the clock it's given, never from the database's now(), so an application with its own idea
- * of the time (e.g. a clock an admin can move, for testing) gets the same idea here.
+ * of the time (e.g. a clock it can move, for testing) gets the same idea here.
  *
- * @internal - use TaskQueue, and the Worker it creates.
+ * @internal - use TaskQueue, and Worker.
  */
 
 declare(strict_types = 1);
@@ -16,44 +16,33 @@ declare(strict_types = 1);
 namespace Programster\PgsqlTaskQueue\Internal;
 
 
-use PgSql\Result;
 use Programster\PgsqlLib\PgSqlConnection;
-use Programster\PgsqlTaskQueue\Batch;
-use Programster\PgsqlTaskQueue\Exceptions\ExceptionBatchNotFound;
-use Programster\PgsqlTaskQueue\Exceptions\ExceptionCantRetryTask;
-use Programster\PgsqlTaskQueue\Exceptions\ExceptionDependencyNotQueued;
-use Programster\PgsqlTaskQueue\Exceptions\ExceptionLeaseLost;
+use Programster\PgsqlTaskQueue\DependencyFailurePolicy;
 use Programster\PgsqlTaskQueue\Exceptions\ExceptionTaskNotFound;
-use Programster\PgsqlTaskQueue\NewTask;
-use Programster\PgsqlTaskQueue\NewTaskCollection;
-use Programster\PgsqlTaskQueue\QueuedTask;
-use Programster\PgsqlTaskQueue\QueuedTaskCollection;
-use Programster\PgsqlTaskQueue\QueueName;
-use Programster\PgsqlTaskQueue\QueueNameCollection;
-use Programster\PgsqlTaskQueue\TaskResult;
-use Programster\PgsqlTaskQueue\TaskStatus;
+use Programster\PgsqlTaskQueue\Exceptions\ExceptionTasksExpired;
+use Programster\PgsqlTaskQueue\ExpiredTask;
+use Programster\PgsqlTaskQueue\ExpiredTaskCollection;
+use Programster\PgsqlTaskQueue\Task;
+use Programster\PgsqlTaskQueue\TaskCollection;
 use Psr\Clock\ClockInterface;
+use Ramsey\Uuid\Uuid;
 
 
 final readonly class TaskStore
 {
-    // The columns QueuedTask::createFromRow() reads.
-    public const TASK_COLUMNS = 'id, batch_id, queue, type, payload, name, status, priority, attempts, max_attempts,'
-        . ' created_at, available_at, started_at, finished_at, duration_ms, worker, result, output, error,'
-        . ' skipped_because_id';
-
-    // An unfinished task, which is the only kind a deduplication key is unique among.
-    private const UNFINISHED = "('blocked', 'waiting', 'running')";
+    // The columns Task::createFromRow() reads, with the status worked out from them.
+    private const TASK_COLUMNS = "id, queue, type, data, group_name, priority, available_at, lease_seconds,"
+        . " on_dependency_failure, created_at,"
+        . " CASE WHEN num_unmet_dependencies > 0 THEN 'blocked' WHEN lease_expires_at IS NOT NULL THEN 'running'"
+        . " ELSE 'waiting' END AS status";
 
     private const SCHEMA_PATTERN = '#^[a-z_][a-z0-9_]{0,62}$#';
-    private const MAX_BATCH_NAME_LENGTH = 1000;
     private const MAX_LEASE_SECONDS = 86400;
 
     private PgSqlConnection $m_connection;
     private ClockInterface $m_clock;
     private string $m_taskTable;
     private string $m_dependencyTable;
-    private string $m_batchTable;
     private string $m_channel;
 
 
@@ -71,7 +60,6 @@ final readonly class TaskStore
         $this->m_clock = $clock;
         $this->m_taskTable = "{$escapedSchema}.\"task\"";
         $this->m_dependencyTable = "{$escapedSchema}.\"task_dependency\"";
-        $this->m_batchTable = "{$escapedSchema}.\"batch\"";
         $this->m_channel = $connection->escapeIdentifier("{$schema}_tasks");
     }
 
@@ -93,165 +81,222 @@ final readonly class TaskStore
     }
 
 
-    public function insertBatch(string $name) : Batch
-    {
-        if ($name === '' || mb_strlen($name) > self::MAX_BATCH_NAME_LENGTH || str_contains($name, "\0"))
-        {
-            $max = self::MAX_BATCH_NAME_LENGTH;
-            throw new \InvalidArgumentException("A batch's name must be 1 to {$max} characters with no NUL bytes.");
-        }
-
-        $query = "INSERT INTO {$this->m_batchTable} (name, created_at) VALUES ($1, $2) RETURNING id, name, created_at";
-        $result = $this->m_connection->query($query, [$name, $this->fetchNowAsText()]);
-        return Batch::createFromRow(self::fetchOneRow($result));
-    }
-
-
-    public function fetchBatch(int $id) : Batch
-    {
-        $query = "SELECT id, name, created_at FROM {$this->m_batchTable} WHERE id = $1";
-        $row = pg_fetch_assoc($this->m_connection->query($query, [$id]));
-
-        if ($row === false)
-        {
-            throw new ExceptionBatchNotFound("There's no batch {$id}.");
-        }
-
-        return Batch::createFromRow($row);
-    }
-
-
     /**
-     * Add the tasks in one transaction, each after the tasks it depends on.
+     * Add tasks, in one transaction, each after the tasks it depends on.
      *
-     * @param NewTaskCollection $tasks
+     * A task that was in the queue before (e.g. one removed when another failed) is added afresh, and its
+     * dependencies on others in the same call (by their old IDs) are linked to their new copies.
      *
-     * @param Batch|null $batch
+     * @param TaskCollection $tasks
      *
-     * @return QueuedTaskCollection - the tasks, in the order they were given. A task whose deduplication key matched
-     * an unfinished task is that task.
+     * @return TaskCollection - the tasks, as added, in the order they were given.
      *
-     * @throws ExceptionDependencyNotQueued - if a task depends on a NewTask that isn't among them.
-     * @throws ExceptionTaskNotFound - if a task depends on a QueuedTask that no longer exists.
+     * @throws \LogicException - if a task depends on one that isn't queued, and isn't among them.
+     * @throws ExceptionTaskNotFound - if a task depends on a queued task that's no longer in the queue.
      */
-    public function insertTasks(NewTaskCollection $tasks, ?Batch $batch) : QueuedTaskCollection
+    public function insertTasks(TaskCollection $tasks) : TaskCollection
     {
         $ordered = self::orderDependenciesFirst($tasks);
 
-        $insertAll = function () use ($ordered, $batch) : array {
-            $queuedByObject = [];
-            $isAnyWaiting = false;
+        $insertAll = function () use ($ordered) : array {
+            $addedByObject = [];
+            $newIdsByOldId = [];
 
             foreach ($ordered as $task)
             {
                 $dependencyIds = [];
 
-                foreach ($task->getQueuedDependencies() as $queuedDependency)
+                foreach ($task->getDependsOn() as $dependency)
                 {
-                    $dependencyIds[] = $queuedDependency->getId();
+                    $dependencyIds[] = $addedByObject[spl_object_id($dependency)]->getId();
                 }
 
-                foreach ($task->getNewDependencies() as $newDependency)
+                foreach ($task->getDependsOnIds() as $dependencyId)
                 {
-                    $dependencyIds[] = $queuedByObject[spl_object_id($newDependency)]->getId();
+                    $dependencyIds[] = $newIdsByOldId[$dependencyId] ?? $dependencyId;
                 }
 
-                $queued = $this->insertTask($task, $batch, array_values(array_unique($dependencyIds)));
-                $queuedByObject[spl_object_id($task)] = $queued;
-                $isAnyWaiting = ($isAnyWaiting || $queued->getStatus() === TaskStatus::WAITING);
+                $added = $this->insertTask($task, array_values(array_unique($dependencyIds)));
+                $addedByObject[spl_object_id($task)] = $added;
+
+                if ($task->isQueued())
+                {
+                    $newIdsByOldId[$task->getId()] = $added->getId();
+                }
             }
 
-            if ($isAnyWaiting)
-            {
-                $this->notify();
-            }
-
-            return $queuedByObject;
+            $this->notify();
+            return $addedByObject;
         };
 
-        $queuedByObject = $this->inTransaction($insertAll);
+        $addedByObject = $this->inTransaction($insertAll);
         $inGivenOrder = [];
 
         foreach ($tasks as $task)
         {
-            $inGivenOrder[] = $queuedByObject[spl_object_id($task)];
+            $inGivenOrder[] = $addedByObject[spl_object_id($task)];
         }
 
-        return new QueuedTaskCollection(...$inGivenOrder);
+        return new TaskCollection(...$inGivenOrder);
     }
 
 
     /**
-     * Claim the next task that's due, from the queues, of a class there's a handler for, and start its lease.
+     * Claim the next task that's ready, from the queues, of a type there's a handler for, and start its lease.
      *
-     * Returns null when there's nothing to claim, which is the usual case for an idle worker, rather than an error,
-     * so it isn't thrown.
+     * @param list<string> $queues
      *
-     * @param QueueNameCollection $queues
-     *
-     * @param list<string> $taskClasses
+     * @param list<string> $types
      *
      * @param string $worker - who's claiming it.
      *
-     * @return ClaimedTask|null
+     * @return TaskCollection - the task claimed, or none when nothing was ready, which is the usual case for an idle
+     * worker, rather than an error.
      */
-    public function claimNext(QueueNameCollection $queues, array $taskClasses, string $worker) : ?ClaimedTask
+    public function claimNext(array $queues, array $types, string $worker) : TaskCollection
     {
-        $queueNames = [];
-
-        foreach ($queues as $queue)
-        {
-            $queueNames[] = $queue->getName();
-        }
-
         $columns = self::TASK_COLUMNS;
 
         $query = <<<SQL
             UPDATE {$this->m_taskTable}
-            SET status = 'running', attempts = attempts + 1, worker = $1, started_at = $2,
-                lease_expires_at = $2::timestamptz + make_interval(secs => lease_seconds)
+            SET worker = $1, lease_expires_at = $2::timestamptz + make_interval(secs => lease_seconds)
             WHERE id = (
                 SELECT id FROM {$this->m_taskTable}
-                WHERE status = 'waiting' AND queue = ANY($3::text[]) AND type = ANY($4::text[]) AND available_at <= $2
-                ORDER BY priority DESC, expected_duration_ms DESC NULLS LAST, id
+                WHERE num_unmet_dependencies = 0 AND lease_expires_at IS NULL
+                    AND queue = ANY($3::text[]) AND type = ANY($4::text[]) AND available_at <= $2
+                ORDER BY priority DESC, seq
                 LIMIT 1
                 FOR UPDATE SKIP LOCKED
             )
-            RETURNING {$columns}, retry_delays_seconds
+            RETURNING {$columns}
             SQL;
 
         $params = [
             $worker,
             $this->fetchNowAsText(),
-            SqlValues::formatTextArray($queueNames),
-            SqlValues::formatTextArray($taskClasses),
+            SqlValues::formatTextArray($queues),
+            SqlValues::formatTextArray($types),
         ];
 
         $result = $this->m_connection->query($query, $params);
-        $row = pg_fetch_assoc($result);
+        $claimed = [];
 
-        if ($row === false)
+        while (($row = pg_fetch_assoc($result)) !== false)
         {
-            $claimed = null;
-        }
-        else
-        {
-            $delays = SqlValues::parseIntArray((string)$row['retry_delays_seconds']);
-            $claimed = new ClaimedTask(QueuedTask::createFromRow($row), $worker, $delays);
+            $claimed[] = Task::createFromRow($row, $this->fetchDependsOnIds((string)$row['id']));
         }
 
-        return $claimed;
+        return new TaskCollection(...$claimed);
     }
 
 
     /**
-     * Extend a claimed task's lease, to the given number of seconds from now.
-     * @param ClaimedTask $claimed
+     * Remove a task that its worker has finished, and release the tasks waiting for it. If its worker no longer holds
+     * it (its lease ran out, so it was already removed as failed), there's nothing to do.
+     * @param Task $task
+     * @param string $worker
+     */
+    public function complete(Task $task, string $worker) : void
+    {
+        $completeAndRelease = function () use ($task, $worker) : void {
+            $query = "SELECT id FROM {$this->m_taskTable} WHERE id = $1 AND worker = $2 FOR UPDATE";
+
+            if (pg_num_rows($this->m_connection->query($query, [$task->getId(), $worker])) === 1)
+            {
+                $this->releaseDependents($task->getId(), null);
+                $this->m_connection->query("DELETE FROM {$this->m_taskTable} WHERE id = $1", [$task->getId()]);
+                $this->notify();
+            }
+        };
+
+        $this->inTransaction($completeAndRelease);
+    }
+
+
+    /**
+     * Remove a task that failed (or is cancelled), and deal with the tasks that depend on it, directly or through
+     * others, as each one's DependencyFailurePolicy says: remove it too, or release it as if this one had finished.
+     *
+     * @param Task $task
+     *
+     * @return TaskCollection - the tasks removed with it, as they were in the queue.
+     *
+     * @throws ExceptionTaskNotFound - if it's no longer in the queue.
+     */
+    public function removeFailed(Task $task) : TaskCollection
+    {
+        $remove = function () use ($task) : TaskCollection {
+            $query = "SELECT id FROM {$this->m_taskTable} WHERE id = $1 FOR UPDATE";
+
+            if (pg_num_rows($this->m_connection->query($query, [$task->getId()])) !== 1)
+            {
+                throw new ExceptionTaskNotFound("There's no task {$task->getId()} in the queue.");
+            }
+
+            $removed = $this->removeWithDependents($task->getId());
+            $this->notify();
+            return $removed;
+        };
+
+        return $this->inTransaction($remove);
+    }
+
+
+    /**
+     * Remove every running task whose lease has run out (its worker must have stopped partway through it), one by one,
+     * each with the tasks that depend on it, as removeFailed() does. Tasks another worker is removing at the same time
+     * are skipped, as that worker removes (and reports) them.
+     *
+     * @return void
+     *
+     * @throws ExceptionTasksExpired - if there were any, once they've all been removed, with them all.
+     */
+    public function removeAllExpired() : void
+    {
+        $expiredTasks = [];
+
+        $removeExpired = function () use (&$expiredTasks) : void {
+            $columns = self::TASK_COLUMNS;
+
+            $query = <<<SQL
+                SELECT {$columns} FROM {$this->m_taskTable}
+                WHERE lease_expires_at < $1
+                ORDER BY seq
+                FOR UPDATE SKIP LOCKED
+                SQL;
+
+            $result = $this->m_connection->query($query, [$this->fetchNowAsText()]);
+
+            while (($row = pg_fetch_assoc($result)) !== false)
+            {
+                $task = Task::createFromRow($row, $this->fetchDependsOnIds((string)$row['id']));
+                $expiredTasks[] = new ExpiredTask($task, $this->removeWithDependents($task->getId()));
+            }
+
+            if (count($expiredTasks) > 0)
+            {
+                $this->notify();
+            }
+        };
+
+        // Thrown once they've been committed, as throwing within the transaction would roll their removal back.
+        $this->inTransaction($removeExpired);
+
+        if (count($expiredTasks) > 0)
+        {
+            throw new ExceptionTasksExpired(new ExpiredTaskCollection(...$expiredTasks));
+        }
+    }
+
+
+    /**
+     * Extend a running task's lease, to the given number of seconds from now.
+     * @param Task $task
      * @param int $seconds
      * @throws \InvalidArgumentException - if the seconds are out of range.
-     * @throws ExceptionLeaseLost - if the worker no longer holds the task.
+     * @throws ExceptionTaskNotFound - if it isn't running (e.g. its lease already ran out, so it was removed).
      */
-    public function extendLease(ClaimedTask $claimed, int $seconds) : void
+    public function extendLease(Task $task, int $seconds) : void
     {
         if ($seconds < 1 || $seconds > self::MAX_LEASE_SECONDS)
         {
@@ -260,317 +305,61 @@ final readonly class TaskStore
         }
 
         $query = <<<SQL
-            UPDATE {$this->m_taskTable} SET lease_expires_at = $4::timestamptz + make_interval(secs => $5)
-            WHERE id = $1 AND status = 'running' AND worker = $2 AND attempts = $3
+            UPDATE {$this->m_taskTable} SET lease_expires_at = $2::timestamptz + make_interval(secs => $3)
+            WHERE id = $1 AND lease_expires_at IS NOT NULL
             SQL;
 
-        $params = [...self::getOwnerParams($claimed), $this->fetchNowAsText(), $seconds];
-        $this->assertStillHeld($claimed, $this->m_connection->query($query, $params));
+        $result = $this->m_connection->query($query, [$task->getId(), $this->fetchNowAsText(), $seconds]);
+
+        if (pg_affected_rows($result) !== 1)
+        {
+            throw new ExceptionTaskNotFound("Task {$task->getId()} isn't running, so its lease can't be extended.");
+        }
     }
 
 
-    /**
-     * Record that a claimed task succeeded, and release the tasks waiting for it.
-     * @param ClaimedTask $claimed
-     * @param TaskResult $result
-     * @param int $durationMs
-     * @throws ExceptionLeaseLost - if the worker no longer holds the task, so its result isn't kept.
-     */
-    public function markSucceeded(ClaimedTask $claimed, TaskResult $result, int $durationMs) : void
+    public function fetch(string $id) : Task
     {
-        $markAndRelease = function () use ($claimed, $result, $durationMs) : void {
-            $query = <<<SQL
-                UPDATE {$this->m_taskTable}
-                SET status = 'succeeded', finished_at = $4, duration_ms = $5, result = $6::jsonb, output = $7,
-                    error = NULL, lease_expires_at = NULL
-                WHERE id = $1 AND status = 'running' AND worker = $2 AND attempts = $3
-                SQL;
+        if (!Uuid::isValid($id))
+        {
+            throw new ExceptionTaskNotFound("There's no task \"{$id}\" in the queue, as that isn't a task's ID.");
+        }
 
-            $params = [
-                ...self::getOwnerParams($claimed),
-                $this->fetchNowAsText(),
-                $durationMs,
-                json_encode($result->getData(), JSON_THROW_ON_ERROR),
-                $result->getOutput(),
-            ];
-
-            $this->assertStillHeld($claimed, $this->m_connection->query($query, $params));
-            $this->releaseDependents($claimed->getTask()->getId());
-            $this->notify();
-        };
-
-        $this->inTransaction($markAndRelease);
-    }
-
-
-    /**
-     * Record that a claimed task failed. A temporary failure with an attempt left goes back in the queue, after its
-     * retry delay. Anything else dies, and skips the tasks that depend on it.
-     *
-     * @param ClaimedTask $claimed
-     *
-     * @param string $error - what went wrong.
-     *
-     * @param bool $isPermanent - whether trying again can't help.
-     *
-     * @param int $durationMs
-     *
-     * @return TaskStatus - WAITING if it'll be retried, or DEAD if it died.
-     *
-     * @throws ExceptionLeaseLost - if the worker no longer holds the task.
-     */
-    public function markFailed(ClaimedTask $claimed, string $error, bool $isPermanent, int $durationMs) : TaskStatus
-    {
-        $markFailed = function () use ($claimed, $error, $isPermanent, $durationMs) : TaskStatus {
-            $now = $this->m_clock->now();
-            $willRetry = (!$isPermanent && $claimed->hasAttemptLeft());
-
-            if ($willRetry)
-            {
-                $retryAt = $now->modify("+{$claimed->getRetryDelayInSeconds()} seconds");
-
-                $query = <<<SQL
-                    UPDATE {$this->m_taskTable}
-                    SET status = 'waiting', available_at = $4, duration_ms = $5, error = $6, lease_expires_at = NULL
-                    WHERE id = $1 AND status = 'running' AND worker = $2 AND attempts = $3
-                    SQL;
-
-                $time = SqlValues::formatTimestamp($retryAt);
-                $status = TaskStatus::WAITING;
-            }
-            else
-            {
-                $query = <<<SQL
-                    UPDATE {$this->m_taskTable}
-                    SET status = 'dead', finished_at = $4, duration_ms = $5, error = $6, lease_expires_at = NULL
-                    WHERE id = $1 AND status = 'running' AND worker = $2 AND attempts = $3
-                    SQL;
-
-                $time = SqlValues::formatTimestamp($now);
-                $status = TaskStatus::DEAD;
-            }
-
-            $params = [...self::getOwnerParams($claimed), $time, $durationMs, $error];
-            $this->assertStillHeld($claimed, $this->m_connection->query($query, $params));
-
-            if (!$willRetry)
-            {
-                $this->skipDependents($claimed->getTask());
-            }
-
-            $this->notify();
-            return $status;
-        };
-
-        return $this->inTransaction($markFailed);
-    }
-
-
-    /**
-     * Put a claimed task back in the queue until a later time, without using up an attempt.
-     * @param ClaimedTask $claimed
-     * @param \DateTimeImmutable $until
-     * @param string $reason
-     * @throws ExceptionLeaseLost - if the worker no longer holds the task.
-     */
-    public function markDeferred(ClaimedTask $claimed, \DateTimeImmutable $until, string $reason) : void
-    {
-        $query = <<<SQL
-            UPDATE {$this->m_taskTable}
-            SET status = 'waiting', attempts = attempts - 1, available_at = $4, error = $5, lease_expires_at = NULL
-            WHERE id = $1 AND status = 'running' AND worker = $2 AND attempts = $3
-            SQL;
-
-        $params = [...self::getOwnerParams($claimed), SqlValues::formatTimestamp($until), $reason];
-        $this->assertStillHeld($claimed, $this->m_connection->query($query, $params));
-    }
-
-
-    /**
-     * Deal with every running task whose lease has run out, as its worker must have stopped partway through it:
-     * retry it (according to its InterruptedTaskPolicy, if it has an attempt left), or fail it.
-     *
-     * @return int - how many were found.
-     */
-    public function recoverExpiredLeases() : int
-    {
-        $recover = function () : int {
-            $query = <<<SQL
-                SELECT id, name, attempts, max_attempts, on_interruption, worker FROM {$this->m_taskTable}
-                WHERE status = 'running' AND lease_expires_at < $1
-                ORDER BY id
-                FOR UPDATE SKIP LOCKED
-                SQL;
-
-            $now = $this->fetchNowAsText();
-            $result = $this->m_connection->query($query, [$now]);
-            $numRecovered = 0;
-
-            while (($row = pg_fetch_assoc($result)) !== false)
-            {
-                $this->recoverExpiredLease($row, $now);
-                $numRecovered++;
-            }
-
-            if ($numRecovered > 0)
-            {
-                $this->notify();
-            }
-
-            return $numRecovered;
-        };
-
-        return $this->inTransaction($recover);
-    }
-
-
-    /**
-     * Retry a dead task from the start, with all its attempts, and un-skip the tasks that were skipped because it
-     * died, so they run once it succeeds.
-     *
-     * @param int $id
-     *
-     * @throws ExceptionTaskNotFound
-     * @throws ExceptionCantRetryTask - if it hasn't died.
-     */
-    public function retry(int $id) : void
-    {
-        $retry = function () use ($id) : void {
-            $selectQuery = "SELECT status FROM {$this->m_taskTable} WHERE id = $1 FOR UPDATE";
-            $row = pg_fetch_assoc($this->m_connection->query($selectQuery, [$id]));
-
-            if ($row === false)
-            {
-                throw new ExceptionTaskNotFound("There's no task {$id}.");
-            }
-
-            if ($row['status'] !== TaskStatus::DEAD->value)
-            {
-                $message = "Only a dead task can be retried, but task {$id} is {$row['status']}.";
-                throw new ExceptionCantRetryTask($message);
-            }
-
-            $retryQuery = <<<SQL
-                UPDATE {$this->m_taskTable}
-                SET status = 'waiting', attempts = 0, available_at = $2, finished_at = NULL, lease_expires_at = NULL
-                WHERE id = $1
-                SQL;
-
-            $this->m_connection->query($retryQuery, [$id, $this->fetchNowAsText()]);
-
-            $unskipQuery = <<<SQL
-                UPDATE {$this->m_taskTable} AS t
-                SET status = 'blocked', skipped_because_id = NULL, finished_at = NULL, error = NULL,
-                    num_unmet_dependencies = (
-                        SELECT count(*) FROM {$this->m_dependencyTable} AS d
-                        JOIN {$this->m_taskTable} AS x ON x.id = d.depends_on_id
-                        WHERE d.task_id = t.id AND x.status <> 'succeeded'
-                    )
-                WHERE t.skipped_because_id = $1 AND t.status = 'skipped'
-                SQL;
-
-            $this->m_connection->query($unskipQuery, [$id]);
-            $this->notify();
-        };
-
-        $this->inTransaction($retry);
-    }
-
-
-    public function fetchTask(int $id) : QueuedTask
-    {
         $columns = self::TASK_COLUMNS;
         $query = "SELECT {$columns} FROM {$this->m_taskTable} WHERE id = $1";
         $row = pg_fetch_assoc($this->m_connection->query($query, [$id]));
 
         if ($row === false)
         {
-            throw new ExceptionTaskNotFound("There's no task {$id}.");
+            throw new ExceptionTaskNotFound("There's no task {$id} in the queue.");
         }
 
-        return QueuedTask::createFromRow($row);
+        return Task::createFromRow($row, $this->fetchDependsOnIds($id));
     }
 
 
-    public function fetchTasksInBatch(Batch $batch) : QueuedTaskCollection
+    public function fetchGroup(string $group) : TaskCollection
     {
         $columns = self::TASK_COLUMNS;
-        $query = "SELECT {$columns} FROM {$this->m_taskTable} WHERE batch_id = $1 ORDER BY id";
-        return self::createTasks($this->m_connection->query($query, [$batch->getId()]));
-    }
+        $query = "SELECT {$columns} FROM {$this->m_taskTable} WHERE group_name = $1 ORDER BY seq";
+        $result = $this->m_connection->query($query, [$group]);
+        $tasks = [];
 
-
-    public function fetchPage(TaskStatus $status, QueueName $queue, int $limit, int $offset) : QueuedTaskCollection
-    {
-        if ($limit < 1 || $offset < 0)
+        while (($row = pg_fetch_assoc($result)) !== false)
         {
-            throw new \InvalidArgumentException("The limit must be at least 1, and the offset at least 0.");
+            $tasks[] = Task::createFromRow($row, $this->fetchDependsOnIds((string)$row['id']));
         }
 
-        $columns = self::TASK_COLUMNS;
-
-        $query = <<<SQL
-            SELECT {$columns} FROM {$this->m_taskTable}
-            WHERE status = $1 AND queue = $2
-            ORDER BY id DESC
-            LIMIT $3 OFFSET $4
-            SQL;
-
-        $params = [$status, $queue->getName(), $limit, $offset];
-        return self::createTasks($this->m_connection->query($query, $params));
-    }
-
-
-    public function isBatchFinished(Batch $batch) : bool
-    {
-        $unfinished = self::UNFINISHED;
-        $query = "SELECT 1 FROM {$this->m_taskTable} WHERE batch_id = $1 AND status IN {$unfinished} LIMIT 1";
-        return (pg_num_rows($this->m_connection->query($query, [$batch->getId()])) === 0);
+        return new TaskCollection(...$tasks);
     }
 
 
     /**
-     * Delete the tasks that finished before a time, and the batches made before it that have no tasks left.
-     * @param \DateTimeInterface $before
-     * @return int - how many tasks were deleted.
-     */
-    public function deleteFinishedBefore(\DateTimeInterface $before) : int
-    {
-        $deleteOld = function () use ($before) : int {
-            $time = SqlValues::formatTimestamp($before);
-
-            $taskQuery = <<<SQL
-                DELETE FROM {$this->m_taskTable}
-                WHERE status IN ('succeeded', 'dead', 'skipped') AND finished_at < $1
-                SQL;
-
-            $numDeleted = pg_affected_rows($this->m_connection->query($taskQuery, [$time]));
-
-            $batchQuery = <<<SQL
-                DELETE FROM {$this->m_batchTable} AS b
-                WHERE b.created_at < $1 AND NOT EXISTS (SELECT 1 FROM {$this->m_taskTable} AS t WHERE t.batch_id = b.id)
-                SQL;
-
-            $this->m_connection->query($batchQuery, [$time]);
-            return $numDeleted;
-        };
-
-        return $this->inTransaction($deleteOld);
-    }
-
-
-    /**
-     * Start listening for the notifications sent when tasks become ready or finish, for waitForNotification().
+     * Start listening for the notifications sent when tasks are added or finish, for waitForNotification().
      */
     public function listen() : void
     {
         $this->m_connection->query("LISTEN {$this->m_channel}");
-    }
-
-
-    public function unlisten() : void
-    {
-        $this->m_connection->query("UNLISTEN {$this->m_channel}");
     }
 
 
@@ -580,9 +369,7 @@ final readonly class TaskStore
      */
     public function waitForNotification(float $seconds) : void
     {
-        $resource = $this->m_connection->getResource();
-
-        $socket = pg_socket($resource);
+        $socket = pg_socket($this->m_connection->getResource());
 
         if ($socket === false)
         {
@@ -597,7 +384,7 @@ final readonly class TaskStore
             $write = null;
             $except = null;
 
-            // An interrupted select() (e.g. by SIGTERM) returns false, which is fine: the worker checks why next.
+            // An interrupted select() (e.g. by SIGTERM) returns false, which is fine: the caller checks why next.
             @stream_select($read, $write, $except, $wholeSeconds, $microseconds);
             $this->drainNotifications();
         }
@@ -607,7 +394,6 @@ final readonly class TaskStore
     /**
      * Read and discard the notifications that have arrived, as which task caused one doesn't matter: the worker just
      * checks the queue again.
-     *
      * @return bool - whether there were any.
      */
     private function drainNotifications() : bool
@@ -626,45 +412,60 @@ final readonly class TaskStore
 
 
     /**
-     * Put the tasks in an order in which each comes after the tasks it depends on, as their IDs are needed to insert
-     * it. The order they were given is kept wherever it can be.
+     * Put the tasks in an order in which each comes after the tasks among them that it depends on, as their IDs are
+     * needed to insert it, keeping the order they were given in wherever it can.
      *
-     * @param NewTaskCollection $tasks
+     * @param TaskCollection $tasks
      *
-     * @return list<NewTask>
+     * @return list<Task>
      *
-     * @throws ExceptionDependencyNotQueued - if a task depends on a NewTask that isn't among them.
+     * @throws \LogicException - if a task depends on one that isn't queued, and isn't among them.
      */
-    private static function orderDependenciesFirst(NewTaskCollection $tasks) : array
+    private static function orderDependenciesFirst(TaskCollection $tasks) : array
     {
         $isGiven = [];
+        $byOldId = [];
 
         foreach ($tasks as $task)
         {
             $isGiven[spl_object_id($task)] = true;
+
+            if ($task->isQueued())
+            {
+                $byOldId[$task->getId()] = $task;
+            }
         }
 
         $ordered = [];
         $isOrdered = [];
 
-        // Adds a task to the order, after the tasks it depends on.
-        $addInOrder = function (NewTask $task) use (&$addInOrder, &$ordered, &$isOrdered, $isGiven) : void {
+        // Adds a task to the order, after the tasks among them that it depends on.
+        $addInOrder = function (Task $task) use (&$addInOrder, &$ordered, &$isOrdered, $isGiven, $byOldId) : void {
             if (!isset($isOrdered[spl_object_id($task)]))
             {
-                foreach ($task->getNewDependencies() as $dependency)
+                $isOrdered[spl_object_id($task)] = true;
+
+                foreach ($task->getDependsOn() as $dependency)
                 {
                     if (!isset($isGiven[spl_object_id($dependency)]))
                     {
-                        throw new ExceptionDependencyNotQueued(
-                            "A task depends on a NewTask that isn't being enqueued with it. Enqueue them together in "
-                            . "one enqueueAll() call, or depend on the QueuedTask that enqueuing it returned."
+                        throw new \LogicException(
+                            "A {$task->getType()} task depends on a {$dependency->getType()} task that isn't in the "
+                            . "queue, and isn't being enqueued with it. Enqueue them together."
                         );
                     }
 
                     $addInOrder($dependency);
                 }
 
-                $isOrdered[spl_object_id($task)] = true;
+                foreach ($task->getDependsOnIds() as $dependencyId)
+                {
+                    if (isset($byOldId[$dependencyId]))
+                    {
+                        $addInOrder($byOldId[$dependencyId]);
+                    }
+                }
+
                 $ordered[] = $task;
             }
         };
@@ -679,285 +480,159 @@ final readonly class TaskStore
 
 
     /**
-     * Insert one task, with its dependencies, which must already exist.
-     * @param NewTask $task
-     * @param Batch|null $batch
-     * @param list<int> $dependencyIds
-     * @return QueuedTask - the task, or the unfinished task with the same deduplication key, if there is one.
-     * @throws ExceptionTaskNotFound - if a dependency no longer exists.
+     * Insert one task, with its dependencies, which must already be in the queue.
+     * @param Task $task
+     * @param list<string> $dependencyIds
+     * @return Task - as added.
+     * @throws ExceptionTaskNotFound - if a dependency isn't in the queue.
      */
-    private function insertTask(NewTask $task, ?Batch $batch, array $dependencyIds) : QueuedTask
+    private function insertTask(Task $task, array $dependencyIds) : Task
     {
-        $now = $this->m_clock->now();
-        $options = $task->getOptions();
-        $numUnmet = 0;
-        $deadDependency = null;
-
         if (count($dependencyIds) > 0)
         {
             // FOR SHARE stops a dependency finishing until this transaction commits, so it can't finish between being
             // checked here and its dependency row being added, which would leave this task blocked forever.
-            $query = <<<SQL
-                SELECT id, name, status, skipped_because_id FROM {$this->m_taskTable}
-                WHERE id = ANY($1::bigint[])
-                FOR SHARE
-                SQL;
-
-            $result = $this->m_connection->query($query, [SqlValues::formatIntArray($dependencyIds)]);
+            $query = "SELECT id FROM {$this->m_taskTable} WHERE id = ANY($1::uuid[]) FOR SHARE";
+            $result = $this->m_connection->query($query, [SqlValues::formatTextArray($dependencyIds)]);
 
             if (pg_num_rows($result) !== count($dependencyIds))
             {
-                throw new ExceptionTaskNotFound("A task depends on a task that no longer exists.");
-            }
-
-            while (($row = pg_fetch_assoc($result)) !== false)
-            {
-                $numUnmet += ($row['status'] === TaskStatus::SUCCEEDED->value) ? 0 : 1;
-                $isDead = in_array($row['status'], [TaskStatus::DEAD->value, TaskStatus::SKIPPED->value], true);
-
-                if ($isDead && $deadDependency === null)
-                {
-                    $deadDependency = $row;
-                }
+                $type = $task->getType();
+                throw new ExceptionTaskNotFound("A {$type} task depends on a task that's no longer in the queue.");
             }
         }
 
-        if ($deadDependency !== null)
-        {
-            $status = TaskStatus::SKIPPED;
-            $finishedAt = SqlValues::formatTimestamp($now);
-            $error = self::describeSkip((int)$deadDependency['id'], $deadDependency['name']);
-
-            // Retrying the task that died un-skips everything skipped because of it, so it's the one recorded.
-            $skippedBecauseId = (int)($deadDependency['skipped_because_id'] ?? $deadDependency['id']);
-        }
-        else
-        {
-            $status = ($numUnmet > 0) ? TaskStatus::BLOCKED : TaskStatus::WAITING;
-            $finishedAt = null;
-            $error = null;
-            $skippedBecauseId = null;
-        }
-
+        $now = $this->m_clock->now();
         $columns = self::TASK_COLUMNS;
-        $unfinished = self::UNFINISHED;
 
         $insertQuery = <<<SQL
             INSERT INTO {$this->m_taskTable} (
-                batch_id, queue, type, payload, name, priority, status, num_unmet_dependencies, max_attempts,
-                retry_delays_seconds, on_interruption, lease_seconds, deduplication_key, available_at, created_at,
-                finished_at, error, skipped_because_id, expected_duration_ms
+                id, queue, type, data, group_name, priority, num_unmet_dependencies, available_at, lease_seconds,
+                on_dependency_failure, created_at
             )
-            VALUES (
-                $1, $2, $3, $4::jsonb, $5, $6, $7, $8, $9, $10::int[], $11, $12, $13, $14, $15, $16, $17, $18,
-                (
-                    SELECT p.duration_ms FROM {$this->m_taskTable} AS p
-                    WHERE p.queue = $2 AND p.name = $5 AND p.status = 'succeeded'
-                    ORDER BY p.finished_at DESC
-                    LIMIT 1
-                )
-            )
-            ON CONFLICT (queue, deduplication_key) WHERE deduplication_key IS NOT NULL AND status IN {$unfinished}
-            DO NOTHING
+            VALUES ($11, $1, $2, $3::jsonb, $4, $5, $6, $7, $8, $9, $10)
             RETURNING {$columns}
             SQL;
 
-        $retrySchedule = $options->getRetrySchedule();
-
         $params = [
-            $batch?->getId(),
-            $task->getQueue()->getName(),
-            get_class($task->getTask()),
-            json_encode($task->getTask(), JSON_THROW_ON_ERROR),
-            $options->getName(),
-            $options->getPriority(),
-            $status,
-            $numUnmet,
-            $retrySchedule->getMaxAttempts(),
-            SqlValues::formatIntArray($retrySchedule->getDelaysInSeconds()),
-            $options->getOnInterruption(),
-            $options->getLeaseSeconds(),
-            $options->getDeduplicationKey(),
-            SqlValues::formatTimestamp($options->getNotBefore() ?? $now),
+            $task->getQueue(),
+            $task->getType(),
+            json_encode($task->getData(), JSON_THROW_ON_ERROR),
+            $task->getGroup(),
+            $task->getPriority(),
+            count($dependencyIds),
+            SqlValues::formatTimestamp($task->getAvailableAt() ?? $now),
+            $task->getLeaseSeconds(),
+            $task->getOnDependencyFailure(),
             SqlValues::formatTimestamp($now),
-            $finishedAt,
-            $error,
-            $skippedBecauseId,
+            Uuid::uuid7()->toString(),
         ];
 
         $row = pg_fetch_assoc($this->m_connection->query($insertQuery, $params));
 
         if ($row === false)
         {
-            $queued = $this->fetchUnfinishedWithKey($task);
+            throw new \UnexpectedValueException("Adding a {$task->getType()} task didn't return it.");
         }
-        else
+
+        if (count($dependencyIds) > 0)
         {
-            $queued = QueuedTask::createFromRow($row);
+            $dependencyQuery = <<<SQL
+                INSERT INTO {$this->m_dependencyTable} (task_id, depends_on_id)
+                SELECT $1::uuid, unnest($2::uuid[])
+                SQL;
 
-            if (count($dependencyIds) > 0)
-            {
-                $dependencyQuery = <<<SQL
-                    INSERT INTO {$this->m_dependencyTable} (task_id, depends_on_id)
-                    SELECT $1, unnest($2::bigint[])
-                    SQL;
-
-                $dependencyParams = [$queued->getId(), SqlValues::formatIntArray($dependencyIds)];
-                $this->m_connection->query($dependencyQuery, $dependencyParams);
-            }
+            $dependencyParams = [(string)$row['id'], SqlValues::formatTextArray($dependencyIds)];
+            $this->m_connection->query($dependencyQuery, $dependencyParams);
         }
 
-        return $queued;
+        return Task::createFromRow($row, $dependencyIds);
     }
 
 
     /**
-     * Fetch the unfinished task that stopped a task being inserted, as it has the same deduplication key.
-     * @param NewTask $task
-     * @return QueuedTask
-     * @throws \RuntimeException - if it finished in the meantime, which is very unlikely, and safe to try again.
+     * Count down the unmet dependencies of the tasks that depend on one that's finished (or failed, for those that
+     * continue anyway).
+     *
+     * @param string $finishedId
+     *
+     * @param DependencyFailurePolicy|null $onlyWithPolicy - only release those with this policy, or null for all.
      */
-    private function fetchUnfinishedWithKey(NewTask $task) : QueuedTask
+    private function releaseDependents(string $finishedId, ?DependencyFailurePolicy $onlyWithPolicy) : void
+    {
+        $query = <<<SQL
+            UPDATE {$this->m_taskTable}
+            SET num_unmet_dependencies = num_unmet_dependencies - 1
+            WHERE id IN (SELECT task_id FROM {$this->m_dependencyTable} WHERE depends_on_id = $1)
+                AND ($2::text IS NULL OR on_dependency_failure = $2::text)
+            SQL;
+
+        $this->m_connection->query($query, [$finishedId, $onlyWithPolicy]);
+    }
+
+
+    /**
+     * Delete a task that failed, release its dependents that continue anyway, and delete those that don't, with
+     * their own dependents in turn, as their policies say.
+     *
+     * @param string $failedId
+     *
+     * @return TaskCollection - the dependents deleted, as they were in the queue.
+     */
+    private function removeWithDependents(string $failedId) : TaskCollection
     {
         $columns = self::TASK_COLUMNS;
-        $unfinished = self::UNFINISHED;
 
         $query = <<<SQL
             SELECT {$columns} FROM {$this->m_taskTable}
-            WHERE queue = $1 AND deduplication_key = $2 AND status IN {$unfinished}
-            SQL;
-
-        $params = [$task->getQueue()->getName(), $task->getOptions()->getDeduplicationKey()];
-        $row = pg_fetch_assoc($this->m_connection->query($query, $params));
-
-        if ($row === false)
-        {
-            throw new \RuntimeException("A task with the same deduplication key finished as this one was added.");
-        }
-
-        return QueuedTask::createFromRow($row);
-    }
-
-
-    /**
-     * Count down the unmet dependencies of the tasks waiting for one that succeeded, and make those with none left
-     * ready to claim.
-     *
-     * @param int $succeededId
-     */
-    private function releaseDependents(int $succeededId) : void
-    {
-        $query = <<<SQL
-            UPDATE {$this->m_taskTable}
-            SET num_unmet_dependencies = num_unmet_dependencies - 1,
-                status = CASE WHEN num_unmet_dependencies = 1 THEN 'waiting' ELSE 'blocked' END
-            WHERE status = 'blocked'
+            WHERE on_dependency_failure = 'remove'
                 AND id IN (SELECT task_id FROM {$this->m_dependencyTable} WHERE depends_on_id = $1)
+            ORDER BY seq
+            FOR UPDATE
             SQL;
 
-        $this->m_connection->query($query, [$succeededId]);
+        $result = $this->m_connection->query($query, [$failedId]);
+        $directDependents = [];
+
+        while (($row = pg_fetch_assoc($result)) !== false)
+        {
+            $directDependents[] = Task::createFromRow($row, $this->fetchDependsOnIds((string)$row['id']));
+        }
+
+        $this->releaseDependents($failedId, DependencyFailurePolicy::CONTINUE);
+        $this->m_connection->query("DELETE FROM {$this->m_taskTable} WHERE id = $1", [$failedId]);
+        $removed = $directDependents;
+
+        foreach ($directDependents as $dependent)
+        {
+            $removed = [...$removed, ...$this->removeWithDependents($dependent->getId())->toArray()];
+        }
+
+        return new TaskCollection(...$removed);
     }
 
 
     /**
-     * Skip every task that depends on one that died, directly or through others, as none of them can run now.
-     * @param QueuedTask $dead
+     * @param string $id
+     * @return list<string> - the IDs of the tasks it depends on that are still in the queue, oldest first.
      */
-    private function skipDependents(QueuedTask $dead) : void
+    private function fetchDependsOnIds(string $id) : array
     {
         $query = <<<SQL
-            WITH RECURSIVE dependent (id) AS (
-                SELECT task_id FROM {$this->m_dependencyTable} WHERE depends_on_id = $1
-                UNION
-                SELECT d.task_id FROM {$this->m_dependencyTable} AS d JOIN dependent ON d.depends_on_id = dependent.id
-            )
-            UPDATE {$this->m_taskTable}
-            SET status = 'skipped', finished_at = $2, skipped_because_id = $1, error = $3
-            WHERE status = 'blocked' AND id IN (SELECT id FROM dependent)
+            SELECT d.depends_on_id FROM {$this->m_dependencyTable} AS d
+            JOIN {$this->m_taskTable} AS t ON t.id = d.depends_on_id
+            WHERE d.task_id = $1
+            ORDER BY t.seq
             SQL;
 
-        $params = [$dead->getId(), $this->fetchNowAsText(), self::describeSkip($dead->getId(), $dead->getName())];
-        $this->m_connection->query($query, $params);
-    }
+        $ids = [];
 
-
-    /**
-     * Retry or fail one task whose lease ran out.
-     * @param array<array-key, string|null> $row - its id, name, attempts, max_attempts, on_interruption and worker.
-     * @param string $now
-     */
-    private function recoverExpiredLease(array $row, string $now) : void
-    {
-        $attempts = (int)$row['attempts'];
-        $canRetry = ($row['on_interruption'] === 'retry' && $attempts < (int)$row['max_attempts']);
-        $what = "Interrupted: worker {$row['worker']} stopped partway through attempt {$attempts}";
-
-        if ($canRetry)
+        foreach (pg_fetch_all_columns($this->m_connection->query($query, [$id])) as $dependsOnId)
         {
-            $query = <<<SQL
-                UPDATE {$this->m_taskTable}
-                SET status = 'waiting', available_at = $2, error = $3, lease_expires_at = NULL
-                WHERE id = $1
-                SQL;
-
-            $this->m_connection->query($query, [$row['id'], $now, "{$what}, so it's being retried."]);
+            $ids[] = (string)$dependsOnId;
         }
-        else
-        {
-            $query = <<<SQL
-                UPDATE {$this->m_taskTable}
-                SET status = 'dead', finished_at = $2, error = $3, lease_expires_at = NULL
-                WHERE id = $1
-                SQL;
 
-            $reason = ($row['on_interruption'] === 'retry')
-                ? "{$what}, and it had no attempts left."
-                : "{$what}, so it was failed, as it may already have done what it does.";
-
-            $this->m_connection->query($query, [$row['id'], $now, $reason]);
-            $this->skipDependents($this->fetchTask((int)$row['id']));
-        }
-    }
-
-
-    /**
-     * @param int $deadId
-     * @param string|null $deadName
-     * @return string - why a task was skipped.
-     */
-    private static function describeSkip(int $deadId, ?string $deadName) : string
-    {
-        $named = ($deadName === null) ? "" : " ({$deadName})";
-        return "Skipped, as task {$deadId}{$named}, which it depends on, died.";
-    }
-
-
-    /**
-     * The params that make an update only change a task that the worker still holds.
-     * @param ClaimedTask $claimed
-     * @return list<int|string>
-     */
-    private static function getOwnerParams(ClaimedTask $claimed) : array
-    {
-        return [$claimed->getTask()->getId(), $claimed->getWorker(), $claimed->getTask()->getAttempts()];
-    }
-
-
-    /**
-     * @param ClaimedTask $claimed
-     * @param Result $result - an update that only changes the task if the worker still holds it.
-     * @throws ExceptionLeaseLost - if it changed nothing.
-     */
-    private function assertStillHeld(ClaimedTask $claimed, Result $result) : void
-    {
-        if (pg_affected_rows($result) !== 1)
-        {
-            $id = $claimed->getTask()->getId();
-
-            throw new ExceptionLeaseLost(
-                "Worker {$claimed->getWorker()} no longer holds task {$id}, as its lease ran out, so this was ignored."
-            );
-        }
+        return $ids;
     }
 
 
@@ -976,8 +651,7 @@ final readonly class TaskStore
     /**
      * Run some work in a transaction, rolling it back if the work throws. If the connection is already in a
      * transaction (e.g. the application is adding a task along with the change that needs it), the work goes in a
-     * savepoint within it instead, so the application's transaction is neither committed early nor lost, and the task
-     * is only added if the application commits.
+     * savepoint within it instead, so the application's transaction is neither committed early nor lost.
      *
      * @template T
      *
@@ -1002,35 +676,5 @@ final readonly class TaskStore
         }
 
         return $result;
-    }
-
-
-    /**
-     * @param Result $result
-     * @return array<array-key, string|null>
-     */
-    private static function fetchOneRow(Result $result) : array
-    {
-        $row = pg_fetch_assoc($result);
-
-        if ($row === false)
-        {
-            throw new \UnexpectedValueException("A query that should have returned a row didn't.");
-        }
-
-        return $row;
-    }
-
-
-    private static function createTasks(Result $result) : QueuedTaskCollection
-    {
-        $tasks = [];
-
-        while (($row = pg_fetch_assoc($result)) !== false)
-        {
-            $tasks[] = QueuedTask::createFromRow($row);
-        }
-
-        return new QueuedTaskCollection(...$tasks);
     }
 }

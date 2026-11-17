@@ -68,7 +68,18 @@ final readonly class TestDatabase
     public static function reset() : void
     {
         $schema = self::SCHEMA;
-        self::get()->query("TRUNCATE {$schema}.task_dependency, {$schema}.task, {$schema}.batch RESTART IDENTITY");
+        self::get()->query("TRUNCATE {$schema}.task_dependency, {$schema}.task RESTART IDENTITY");
         self::get()->query("TRUNCATE public.test_run");
+    }
+
+
+    /**
+     * Count the tasks in the queue.
+     * @return int
+     */
+    public static function countTasks() : int
+    {
+        $schema = self::SCHEMA;
+        return (int)pg_fetch_result(self::get()->query("SELECT count(*) FROM {$schema}.task"), 0, 0);
     }
 }

@@ -11,27 +11,28 @@
 - [Licence](#licence)
 
 ## What it's for
-A queue of tasks kept in PostgreSQL, which any number of workers, on any number of machines, take tasks from and
-run. It's for background jobs (sending emails, syncing with an API, nightly reports), and for splitting up a large
-piece of work (e.g. a test suite) to run in parallel.
+A simple queue of tasks kept in PostgreSQL, which any number of workers, on any number of machines, take tasks from
+and run. Its one job is scheduling tasks (which may depend on others), and letting workers take them and run them. It's
+for background jobs (sending emails, syncing with an API), and for splitting up a large piece of work (e.g. a test
+suite) to run in parallel.
 
-- **Dependencies:** a task can depend on others, and only runs once they've all succeeded. If one dies, everything
-  that depends on it is skipped, saying why.
-- **Each task runs once at a time:** workers claim tasks with `FOR UPDATE SKIP LOCKED`, so no two ever get the same
-  one, and nothing else (e.g. Redis) is needed.
-- **Workers that stop partway through:** each task has a lease. If its worker dies, the task is retried or failed
-  once the lease runs out, depending on whether it's safe to run twice.
-- **Retries, deferral and priorities:** temporary failures are retried on a schedule, a task that can't run yet (e.g.
-  at a rate limit) can be put back until later, and higher priorities go first.
-- **Batches:** a group of tasks (e.g. one test run) can be summarised and waited for together, and the tasks that
-  took longest last time go first, so the batch finishes sooner.
-- **Everything is recorded:** each task's result, output, errors, attempts and timings stay in the table until
-  deleted, for an admin page or a summary.
-- **Starts straight away:** an idle worker is woken by `NOTIFY` as soon as a task is ready.
+- **Dependencies:** a task can depend on others, and only runs once they've all finished. When one fails, each task
+  that depends on it is removed too, or runs anyway, as it chooses.
+- **Each task runs once:** workers claim tasks with `FOR UPDATE SKIP LOCKED`, so no two ever get the same one, and
+  nothing else (e.g. Redis) is needed.
+- **Workers that stop partway through:** each task has a lease. If its worker dies, the task is removed (with its
+  dependents) once the lease runs out, rather than run twice, and the worker throws, saying so.
+- **Priorities, delays and groups:** higher priorities go first, a task can wait until a time, and tasks can share a
+  group name (e.g. a UUID for a test run) to be fetched together.
+- **Starts straight away:** an idle worker is woken by `NOTIFY` as soon as a task is added or finishes.
+
+Everything else is left to the application: a handled task is simply removed, and when one fails, the worker throws
+`ExceptionTaskFailed`, with the task and the tasks removed with it, for the application to log, retry (by enqueueing
+them again) or ignore.
 
 ## Requirements
-- PHP 8.2, 8.3, 8.4 or 8.5, with the `pgsql` extension. The `pcntl` extension is recommended, so a worker stops
-  cleanly on SIGTERM and SIGINT.
+- PHP 8.2, 8.3, 8.4 or 8.5, with the `pgsql` extension. The `pcntl` extension is useful for a worker to stop cleanly
+  on SIGTERM.
 - PostgreSQL 14, 15, 16, 17 or 18.
 
 ## Installation
@@ -40,96 +41,62 @@ composer require programster/pgsql-task-queue
 ```
 
 ## Quick start
-A task holds the data for one piece of work, and a handler does the work:
+Create the tables, add some tasks, and run a worker:
 
 ```php
-<?php
-
-require_once(__DIR__ . '/vendor/autoload.php');
-
 use Programster\PgsqlLib\PgSqlConnection;
 
-final readonly class SendWelcomeEmail implements TaskInterface
+// A handler runs one type of task, given its data.
+final class SendWelcomeEmailHandler implements TaskHandlerInterface
 {
-    private string $m_memberId;
-
-    public function __construct(string $memberId)
+    public function getType() : string
     {
-        $this->m_memberId = $memberId;
+        return 'send-welcome-email';
     }
 
-    public static function createFromArray(array $data) : static
-    {
-        return new SendWelcomeEmail($data['memberId']);
-    }
 
-    public function jsonSerialize() : array
+    public function handle(Task $task) : void
     {
-        return ['memberId' => $this->m_memberId];
+        $email = $task->getData()['email'];
+        echo "Sending a welcome email to {$email}." . PHP_EOL;
     }
-
-    public function getMemberId() : string { return $this->m_memberId; }
 }
 
-final readonly class SendWelcomeEmailHandler implements TaskHandlerInterface
+$connection = PgSqlConnection::create('localhost', 'app', 'app', 'secret');
+TaskQueue::createTables($connection);
+$queue = new TaskQueue($connection);
+
+// A task's data is any JsonSerializable, or an array.
+$welcome = Task::create('send-welcome-email', ['email' => 'jo@example.com'], queue: 'emails');
+$reminder = Task::create('send-welcome-email', ['email' => 'sam@example.com'], queue: 'emails');
+$queue->enqueue($welcome, $reminder);
+
+// The application writes the worker's loop, so it can log, stop and handle failures however it likes.
+$worker = new Worker($queue, ['emails'], new SendWelcomeEmailHandler());
+
+while ($worker->runNext())
 {
-    public function getTaskClass() : string
-    {
-        return SendWelcomeEmail::class;
-    }
-
-    public function handle(TaskInterface $task, TaskContext $context) : TaskResult
-    {
-        // ... send the email to $task->getMemberId() ...
-        return new TaskResult(['sent' => true]);
-    }
+    // Run every task that's ready, then stop. A long-running worker waits for more (see docs/workers.md).
 }
-```
-
-Install the tables once (e.g. alongside your own migrations), then add tasks:
-
-```php
-$connection = PgSqlConnection::create('localhost', 'myapp', 'myapp', 'secret', forceNew: true);
-TaskQueueSchema::migrate($connection);
-$queue = new TaskQueue($connection, new SystemClock());
-$emails = new QueueName('emails');
-
-$options = new TaskOptions(retrySchedule: RetrySchedule::createUsingDelaysInSeconds(60, 300, 1800));
-$queued = $queue->enqueue(new NewTask(new SendWelcomeEmail('member-1'), $emails, $options));
-```
-
-And run a worker, in a long-running process of its own (e.g. under supervisord), with a connection of its own:
-
-```php
-$workerConnection = PgSqlConnection::create('localhost', 'myapp', 'myapp', 'secret', forceNew: true);
-$workerQueue = new TaskQueue($workerConnection, new SystemClock());
-
-$worker = $workerQueue->createWorker(
-    new TaskHandlerCollection(new SendWelcomeEmailHandler()),
-    new QueueNameCollection($emails),
-    stopConditions: new WorkerStopConditions(stopWhenIdle: true) // just for this example: normally, leave it running
-);
-
-$worker->run();
-assert($queue->fetchTask($queued->getId())->getStatus() === TaskStatus::SUCCEEDED);
 ```
 
 ## Design principles
-- **Mistakes fail where they're made.** Values are checked when they're created: a misspelt queue name, a task that
-  can't be stored as JSON, or a lease of 0 throws on the line that made it, not in a worker hours later. A cycle of
-  dependencies can't even be built, as a task can only depend on tasks that already exist.
-- **Safe defaults.** A task that's interrupted is failed, not run again, unless it says it's safe to retry
-  (`InterruptedTaskPolicy::RETRY`), so an email or payment never happens twice by default. Nothing is retried unless
-  it has a `RetrySchedule`.
-- **One source of truth.** Everything is in PostgreSQL, in its own schema, so it's backed up, inspected and queried
-  like the rest of your data. A task can be added in the same transaction as the change that needs it, so it only
-  exists if that change is committed.
-- **Your clock.** Every time comes from the PSR-20 clock it's given, never the database's, so an application that can
-  move its clock (e.g. for testing) moves the queue's too.
+- **Small.** Thirteen public classes: one `Task`, the queue, a worker, a handler interface, two enums, three
+  exceptions, an `ExpiredTask`, and collections of tasks, task IDs and expired tasks. Logging, retries, deduplication
+  and keeping a history are left to the application.
+- **Mistakes fail where they're made.** A task is checked when it's created: an empty type, data that can't be stored
+  as JSON, or a lease of 0 throws on the line that made it, not in a worker hours later. A cycle of dependencies can't
+  even be built, as a task can only depend on tasks that already exist.
+- **Failures are thrown, never hidden.** A task that fails is removed, and the worker throws, with everything needed to
+  put it back.
+- **One source of truth.** Everything is in PostgreSQL, in its own schema. Tasks can be added in the same transaction
+  as the change that needs them, so they only exist if that change is committed.
+- **Your clock.** Every time comes from the PSR-20 clock it's given (or the real time), never the database's, so an
+  application that can move its clock (e.g. for testing) moves the queue's too.
 
 ## Documentation
-See [docs/README.md](docs/README.md) for everything else: tasks and handlers, dependencies and batches, workers,
-retries and failures, looking after the queue, testing and upgrading.
+See [docs/README.md](docs/README.md) for everything else: tasks, workers, looking after the queue, testing and
+upgrading.
 
 ## Licence
 MIT. See [LICENSE](LICENSE).

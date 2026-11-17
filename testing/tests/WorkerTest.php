@@ -1,403 +1,255 @@
 <?php
 
 /*
- * Tests of a worker running tasks in this process, with a fake clock: success and the tasks it releases, temporary
- * and permanent failures, retries, deferral, lost leases, interrupted tasks, retrying dead tasks, priorities, stop
- * conditions, signals and deleting old tasks.
+ * Tests of a worker running tasks in this process, with a fake clock: success, releasing and ordering, failures and
+ * the dependency policies, re-enqueueing what failed, expired and extended leases, and what a worker rejects.
  */
 
-use Programster\PgsqlTaskQueue\Exceptions\ExceptionCantRetryTask;
-use Programster\PgsqlTaskQueue\InterruptedTaskPolicy;
-use Programster\PgsqlTaskQueue\NewTaskCollection;
-use Programster\PgsqlTaskQueue\QueueName;
-use Programster\PgsqlTaskQueue\QueueNameCollection;
-use Programster\PgsqlTaskQueue\RetrySchedule;
-use Programster\PgsqlTaskQueue\TaskHandlerCollection;
-use Programster\PgsqlTaskQueue\TaskOptions;
+use Programster\PgsqlTaskQueue\DependencyFailurePolicy;
+use Programster\PgsqlTaskQueue\Exceptions\ExceptionTaskFailed;
+use Programster\PgsqlTaskQueue\Exceptions\ExceptionTaskNotFound;
+use Programster\PgsqlTaskQueue\Exceptions\ExceptionTasksExpired;
+use Programster\PgsqlTaskQueue\Task;
+use Programster\PgsqlTaskQueue\TaskCollection;
+use Programster\PgsqlTaskQueue\TaskQueue;
 use Programster\PgsqlTaskQueue\TaskStatus;
 use Programster\PgsqlTaskQueue\Testing\FakeClock;
-use Programster\PgsqlTaskQueue\Testing\Fixtures;
-use Programster\PgsqlTaskQueue\Testing\HandledLog;
-use Programster\PgsqlTaskQueue\Testing\RecordingLogger;
 use Programster\PgsqlTaskQueue\Testing\SmokeTest;
 use Programster\PgsqlTaskQueue\Testing\TestDatabase;
-use Programster\PgsqlTaskQueue\Testing\TestTaskBehaviour;
-use Programster\PgsqlTaskQueue\Testing\TestTaskHandler;
-use Programster\PgsqlTaskQueue\WorkerStopConditions;
-use Programster\PgsqlTaskQueue\WorkerStopReason;
+use Programster\PgsqlTaskQueue\Testing\TestHandler;
+use Programster\PgsqlTaskQueue\Worker;
+
+/**
+ * Run a worker until there's nothing it can run, collecting the failures it throws.
+ * @param Worker $worker
+ * @return list<ExceptionTaskFailed>
+ */
+function workerTestRunAll(Worker $worker) : array
+{
+    $failures = [];
+    $isIdle = false;
+
+    while (!$isIdle)
+    {
+        try
+        {
+            $isIdle = !$worker->runNext();
+        }
+        catch (ExceptionTaskFailed $failure)
+        {
+            $failures[] = $failure;
+        }
+    }
+
+    return $failures;
+}
+
 
 /** @var SmokeTest $smoke */
 
-
-$successReleasesDependents = function () : void {
-    $clock = new FakeClock();
-    $queue = Fixtures::createQueue($clock);
-    $a = Fixtures::createTask('a');
-    $b = Fixtures::createTask('b');
-    $c = Fixtures::createTask('c', TestTaskBehaviour::SUCCEED, new TaskOptions(), $a, $b);
-    $queued = $queue->enqueueAll(new NewTaskCollection($c, $b, $a));
-    $log = new HandledLog();
-    $reason = Fixtures::createWorker($queue, $clock, $log)->run();
-
-    SmokeTest::assertSame(WorkerStopReason::IDLE, $reason, "why the worker stopped");
-    SmokeTest::assertSame(['a#1', 'b#1', 'c#1'], $log->getEntries(), "what ran, in order");
-    $c = $queue->fetchTask($queued->get(0)->getId());
-    SmokeTest::assertSame(TaskStatus::SUCCEEDED, $c->getStatus(), "c's status");
-    SmokeTest::assertSame(['label' => 'c'], $c->getResultData(), "c's result data");
-    SmokeTest::assertSame('ran c', $c->getOutput(), "c's output");
-    assert($c->getFinishedAt() == $clock->now() && $c->getDurationMs() !== null, "Its finish is recorded.");
+$getLabel = function (Task $task) : string {
+    return TestHandler::getLabel($task);
 };
 
-$smoke->run("worker: a task runs once all its dependencies have succeeded", $successReleasesDependents);
-
-$priorities = function () : void {
+$runsInOrder = function () : void {
     $clock = new FakeClock();
-    $queue = Fixtures::createQueue($clock);
-    $low = Fixtures::createTask('low', options: new TaskOptions(priority: -1));
-    $normal = Fixtures::createTask('normal');
-    $high = Fixtures::createTask('high', options: new TaskOptions(priority: 10));
-    $queue->enqueueAll(new NewTaskCollection($low, $normal, $high));
-    $log = new HandledLog();
-    Fixtures::createWorker($queue, $clock, $log)->run();
-    SmokeTest::assertSame(['high#1', 'normal#1', 'low#1'], $log->getEntries(), "the order they ran in");
-};
+    TestDatabase::reset();
+    $queue = new TaskQueue(TestDatabase::get(), $clock, TestDatabase::SCHEMA);
+    $a = TestHandler::createTask('a');
+    $b = TestHandler::createTask('b', priority: 10);
+    $c = TestHandler::createTask('c', dependsOn: new TaskCollection($a, $b));
+    $later = TestHandler::createTask('later', notBefore: $clock->now()->modify('+1 hour'));
+    $elsewhere = TestHandler::createTask('elsewhere', queue: 'other');
+    $otherType = Task::create('other-type', [], 'tests');
+    $queue->enqueue($c, $a, $b, $later, $elsewhere, $otherType);
+    $handler = new TestHandler(TestDatabase::get());
+    $worker = new Worker($queue, ['tests'], $handler);
 
-$smoke->run("worker: tasks with a higher priority are claimed first", $priorities);
+    SmokeTest::assertSame([], workerTestRunAll($worker), "the failures");
+    SmokeTest::assertSame(['b', 'a', 'c'], $handler->getHandled(), "what ran, in order: priority, then oldest");
+    SmokeTest::assertSame(3, TestDatabase::countTasks(), "the tasks left: later, elsewhere and the other type");
 
-$slowestFirst = function () : void {
-    $clock = new FakeClock();
-    $queue = Fixtures::createQueue($clock);
-    $queue->enqueue(Fixtures::createTask('quick', options: new TaskOptions(name: 'quick')));
-    $queue->enqueue(Fixtures::createTask('slow', options: new TaskOptions(name: 'slow')));
-    Fixtures::createWorker($queue, $clock, new HandledLog())->run();
-    TestDatabase::get()->query("UPDATE task_queue_test.task SET duration_ms = 5000 WHERE name = 'slow'");
-
-    // Named like the last ones, the slow one is expected to take longer, so it's claimed first, though added last.
-    $queue->enqueue(Fixtures::createTask('quick again', options: new TaskOptions(name: 'quick')));
-    $queue->enqueue(Fixtures::createTask('slow again', options: new TaskOptions(name: 'slow')));
-    $log = new HandledLog();
-    Fixtures::createWorker($queue, $clock, $log)->run();
-    SmokeTest::assertSame(['slow again#1', 'quick again#1'], $log->getEntries(), "the order they ran in");
-};
-
-$smoke->run("worker: among equal priorities, the task expected to take longest is claimed first", $slowestFirst);
-
-$temporaryFailureRetried = function () : void {
-    $clock = new FakeClock();
-    $queue = Fixtures::createQueue($clock);
-    $options = new TaskOptions(retrySchedule: RetrySchedule::createUsingDelaysInSeconds(60, 300));
-    $task = $queue->enqueue(Fixtures::createTask('flaky', TestTaskBehaviour::FAIL_TEMPORARILY, $options));
-    $log = new HandledLog();
-    $logger = new RecordingLogger();
-    Fixtures::createWorker($queue, $clock, $log, $logger)->run();
-
-    $afterFirst = $queue->fetchTask($task->getId());
-    SmokeTest::assertSame(TaskStatus::WAITING, $afterFirst->getStatus(), "the status after a temporary failure");
-    assert($afterFirst->getAvailableAt() == $clock->now()->modify('+60 seconds'), "It's retried after 60 seconds.");
-    assert(str_contains((string)$afterFirst->getError(), "flaky failed temporarily"), "The error is recorded.");
-    assert($logger->hasLineContaining("notice: Task 1, attempt 1 of 3, failed, and will be retried"), "It's logged.");
-
-    // Not before its retry is due.
-    Fixtures::createWorker($queue, $clock, $log)->run();
-    SmokeTest::assertSame(['flaky#1'], $log->getEntries(), "what ran before the retry was due");
-
-    $clock->advance(60);
-    Fixtures::createWorker($queue, $clock, $log)->run();
-    $clock->advance(300);
-    Fixtures::createWorker($queue, $clock, $log, $logger)->run();
-    SmokeTest::assertSame(['flaky#1', 'flaky#2', 'flaky#3'], $log->getEntries(), "every attempt");
-    SmokeTest::assertSame(TaskStatus::DEAD, $queue->fetchTask($task->getId())->getStatus(), "the status at the end");
-    assert($logger->hasLineContaining("error: Task 1, attempt 3 of 3, died"), "Its death is logged as an error.");
-};
-
-$smoke->run("worker: a temporary failure is retried after each delay, then dies", $temporaryFailureRetried);
-
-$permanentFailureSkipsChain = function () : void {
-    $clock = new FakeClock();
-    $queue = Fixtures::createQueue($clock);
-    $options = new TaskOptions(retrySchedule: RetrySchedule::createUsingDelaysInSeconds(60), name: 'broken');
-    $a = Fixtures::createTask('a', TestTaskBehaviour::FAIL_PERMANENTLY, $options);
-    $b = Fixtures::createTask('b', TestTaskBehaviour::SUCCEED, new TaskOptions(), $a);
-    $c = Fixtures::createTask('c', TestTaskBehaviour::SUCCEED, new TaskOptions(), $b);
-    $unrelated = Fixtures::createTask('unrelated');
-    $batch = $queue->createBatch('run');
-    $queued = $queue->enqueueAll(new NewTaskCollection($a, $b, $c, $unrelated), $batch);
-    $log = new HandledLog();
-    Fixtures::createWorker($queue, $clock, $log)->run();
-
-    SmokeTest::assertSame(['a#1', 'unrelated#1'], $log->getEntries(), "what ran");
-    SmokeTest::assertSame(TaskStatus::DEAD, $queue->fetchTask($queued->get(0)->getId())->getStatus(), "a's status");
-
-    foreach ([1, 2] as $index)
-    {
-        $skipped = $queue->fetchTask($queued->get($index)->getId());
-        SmokeTest::assertSame(TaskStatus::SKIPPED, $skipped->getStatus(), "a dependent's status");
-        SmokeTest::assertSame($queued->get(0)->getId(), $skipped->getSkippedBecauseId(), "what it was skipped for");
-        assert(str_contains((string)$skipped->getError(), "task 1 (broken), which it depends on, died"));
-    }
-
-    // A task added later that depends on the dead one is skipped straight away.
-    $late = Fixtures::createTask('late', TestTaskBehaviour::SUCCEED, new TaskOptions(), $queued->get(2));
-    SmokeTest::assertSame(TaskStatus::SKIPPED, $queue->enqueue($late)->getStatus(), "a late dependent's status");
-
-    $summary = $queue->fetchBatchSummary($batch);
-    assert($summary->isFinished() && !$summary->isAllSucceeded(), "The batch finished, but not all succeeded.");
-    SmokeTest::assertSame(2, $summary->countWithStatus(TaskStatus::SKIPPED), "skipped tasks in the batch");
-};
-
-$smoke->run("worker: a permanent failure dies at once, skipping all that depends on it", $permanentFailureSkipsChain);
-
-$retryDeadUnskips = function () : void {
-    $clock = new FakeClock();
-    $queue = Fixtures::createQueue($clock);
-    $a = Fixtures::createTask('a', TestTaskBehaviour::FAIL_PERMANENTLY);
-    $other = Fixtures::createTask('other');
-    $b = Fixtures::createTask('b', TestTaskBehaviour::SUCCEED, new TaskOptions(), $a, $other);
-    $c = Fixtures::createTask('c', TestTaskBehaviour::SUCCEED, new TaskOptions(), $b);
-    $queued = $queue->enqueueAll(new NewTaskCollection($a, $other, $b, $c));
-    Fixtures::createWorker($queue, $clock, new HandledLog())->run();
-
-    $retryUnfinished = function () use ($queue, $queued) : void {
-        $queue->retry($queued->get(2)->getId());
-    };
-
-    SmokeTest::expectException(ExceptionCantRetryTask::class, $retryUnfinished, "skipped");
-
-    // Make it succeed this time, then retry it.
-    $succeedPayload = '{"label": "a", "behaviour": "succeed", "sleepMs": 0}';
-    $update = 'UPDATE task_queue_test.task SET payload = $1 WHERE id = $2';
-    TestDatabase::get()->query($update, [$succeedPayload, $queued->get(0)->getId()]);
-    $queue->retry($queued->get(0)->getId());
-    $c = $queue->fetchTask($queued->get(3)->getId());
-    SmokeTest::assertSame(TaskStatus::BLOCKED, $c->getStatus(), "c's status, un-skipped");
-    $log = new HandledLog();
-    Fixtures::createWorker($queue, $clock, $log)->run();
-    SmokeTest::assertSame(['a#1', 'b#1', 'c#1'], $log->getEntries(), "what ran after the retry");
-};
-
-$smoke->run("worker: retrying a dead task un-skips the tasks that depended on it", $retryDeadUnskips);
-
-$deferral = function () : void {
-    $clock = new FakeClock();
-    $queue = Fixtures::createQueue($clock);
-    $task = $queue->enqueue(Fixtures::createTask('limited', TestTaskBehaviour::DEFER_ONCE));
-    $log = new HandledLog();
-    Fixtures::createWorker($queue, $clock, $log)->run();
-
-    $deferred = $queue->fetchTask($task->getId());
-    SmokeTest::assertSame(TaskStatus::WAITING, $deferred->getStatus(), "the status while deferred");
-    SmokeTest::assertSame(0, $deferred->getAttempts(), "attempts used by a deferral");
-    assert($deferred->getAvailableAt() == $clock->now()->modify('+1 hour'), "It waits until the time given.");
-
+    // Once it's due.
     $clock->advance(3600);
-    Fixtures::createWorker($queue, $clock, $log)->run();
-    SmokeTest::assertSame(['limited#1', 'limited#1'], $log->getEntries(), "both runs were its first attempt");
-    SmokeTest::assertSame(TaskStatus::SUCCEEDED, $queue->fetchTask($task->getId())->getStatus(), "its final status");
+    workerTestRunAll($worker);
+    SmokeTest::assertSame(['b', 'a', 'c', 'later'], $handler->getHandled(), "what ran once later was due");
 };
 
-$smoke->run("worker: a deferred task waits until the time given, without using an attempt", $deferral);
+$smoke->run("worker: runs each task once its dependencies have finished, by priority, and removes it", $runsInOrder);
 
-$lostLease = function () : void {
-    foreach ([InterruptedTaskPolicy::RETRY, InterruptedTaskPolicy::FAIL] as $policy)
-    {
-        $clock = new FakeClock();
-        $queue = Fixtures::createQueue($clock);
+$failurePolicies = function () use ($getLabel) : void {
+    TestDatabase::reset();
+    $queue = new TaskQueue(TestDatabase::get(), new FakeClock(), TestDatabase::SCHEMA);
+    $fails = TestHandler::createTask('fails', 'fail');
+    $removed = TestHandler::createTask('removed', dependsOn: new TaskCollection($fails));
+    $removedToo = TestHandler::createTask('removed too', dependsOn: new TaskCollection($removed));
 
-        $options = new TaskOptions(
-            retrySchedule: RetrySchedule::createUsingDelaysInSeconds(1),
-            onInterruption: $policy,
-            leaseSeconds: 60
-        );
+    $continues = TestHandler::createTask(
+        'continues',
+        dependsOn: new TaskCollection($fails),
+        onDependencyFailure: DependencyFailurePolicy::CONTINUE
+    );
 
-        $task = $queue->enqueue(Fixtures::createTask('slow', TestTaskBehaviour::LOSE_LEASE, $options));
-        $logger = new RecordingLogger();
-        Fixtures::createWorker($queue, $clock, new HandledLog(), $logger, maxTasks: 1)->run();
+    $afterRemoved = TestHandler::createTask(
+        'continues after removed',
+        dependsOn: new TaskCollection($removed),
+        onDependencyFailure: DependencyFailurePolicy::CONTINUE
+    );
 
-        // The worker's result was ignored, as another worker (here, the handler) had recovered the task.
-        assert($logger->hasLineContaining("no longer holds task"), "The lost lease is logged.");
-        $recovered = $queue->fetchTask($task->getId());
-        $expected = ($policy === InterruptedTaskPolicy::RETRY) ? TaskStatus::WAITING : TaskStatus::DEAD;
-        SmokeTest::assertSame($expected, $recovered->getStatus(), "the status with {$policy->value}");
-        assert(str_contains((string)$recovered->getError(), "Interrupted: worker"), "The interruption is recorded.");
-        SmokeTest::assertSame(null, $recovered->getResultData(), "the ignored result");
-    }
+    $queue->enqueue($fails, $removed, $removedToo, $continues, $afterRemoved);
+    $handler = new TestHandler(TestDatabase::get());
+    $failures = workerTestRunAll(new Worker($queue, ['tests'], $handler));
+
+    SmokeTest::assertSame(1, count($failures), "the failures");
+    $failure = $failures[0];
+    SmokeTest::assertSame('fails', $getLabel($failure->getTask()), "the task that failed");
+    SmokeTest::assertSame("fails failed.", $failure->getPrevious()?->getMessage(), "the cause");
+    SmokeTest::assertSame(['removed', 'removed too'], $failure->getDependents()->map($getLabel), "those removed");
+    SmokeTest::assertSame(['fails', 'continues', 'continues after removed'], $handler->getHandled(), "what ran");
+    SmokeTest::assertSame(0, TestDatabase::countTasks(), "the tasks left");
 };
 
-$smoke->run("worker: a task whose lease ran out is retried or failed, by its policy, ignoring its result", $lostLease);
+$smoke->run("worker: a failure removes REMOVE dependents (in turn), and releases CONTINUE ones", $failurePolicies);
 
-$extendLease = function () : void {
+$reEnqueue = function () use ($getLabel) : void {
+    TestDatabase::reset();
+    $queue = new TaskQueue(TestDatabase::get(), new FakeClock(), TestDatabase::SCHEMA);
+    $flaky = TestHandler::createTask('flaky', 'fail');
+    $dependent = TestHandler::createTask('dependent', dependsOn: new TaskCollection($flaky));
+    $dependentToo = TestHandler::createTask('dependent too', dependsOn: new TaskCollection($dependent));
+    $queue->enqueue($flaky, $dependent, $dependentToo);
+    $worker = new Worker($queue, ['tests'], new TestHandler(TestDatabase::get()));
+    $failure = workerTestRunAll($worker)[0];
+
+    // Put back as they were, given in any order, with the links among them kept, to their new IDs.
+    $again = $queue->enqueue(...[...$failure->getDependents()->toArray(), $failure->getTask()]);
+    [$againDependent, $againDependentToo, $againFlaky] = $again->toArray();
+    assert($againFlaky->getId() !== $failure->getTask()->getId(), "It's added afresh, with a new ID.");
+    $link = $againDependent->getDependsOnIds()->toArray();
+    SmokeTest::assertSame([$againFlaky->getId()], $link, "the dependent's link");
+    $nextLink = $againDependentToo->getDependsOnIds()->toArray();
+    SmokeTest::assertSame([$againDependent->getId()], $nextLink, "the next one's link");
+    SmokeTest::assertSame(TaskStatus::BLOCKED, $againDependentToo->getStatus(), "its status");
+
+    // It fails again, taking them with it again.
+    $failures = workerTestRunAll($worker);
+    SmokeTest::assertSame(1, count($failures), "the failures the second time");
+    $removed = $failures[0]->getDependents()->map($getLabel);
+    SmokeTest::assertSame(['dependent', 'dependent too'], $removed, "those removed the second time");
+
+    // Re-enqueueing a dependent without the task it waited for, which is gone, is rejected.
+    $enqueueAlone = function () use ($queue, $failures) : void {
+        $queue->enqueue($failures[0]->getDependents()->first());
+    };
+
+    SmokeTest::expectException(ExceptionTaskNotFound::class, $enqueueAlone);
+};
+
+$smoke->run("worker: what failed can be re-enqueued as it is, with its dependents' links kept", $reEnqueue);
+
+$expiredLeases = function () use ($getLabel) : void {
     $clock = new FakeClock();
-    $queue = Fixtures::createQueue($clock);
-    $task = $queue->enqueue(Fixtures::createTask('long', options: new TaskOptions(leaseSeconds: 60)));
-    $store = new \Programster\PgsqlTaskQueue\Internal\TaskStore(TestDatabase::get(), $clock, TestDatabase::SCHEMA);
-    $queues = new QueueNameCollection(new QueueName(Fixtures::QUEUE));
-    $claimed = $store->claimNext($queues, [\Programster\PgsqlTaskQueue\Testing\TestTask::class], 'me');
-    assert($claimed !== null && $claimed->getTask()->getId() === $task->getId(), "It's claimed.");
-    $context = new \Programster\PgsqlTaskQueue\TaskContext($store, $claimed);
-    assert($context->isLastAttempt() && $context->getAttempt() === 1 && $context->getWorker() === 'me');
+    TestDatabase::reset();
+    $queue = new TaskQueue(TestDatabase::get(), $clock, TestDatabase::SCHEMA);
+    $slow = TestHandler::createTask('slow', leaseSeconds: 60);
+    $dependent = TestHandler::createTask('dependent', dependsOn: new TaskCollection($slow));
+    $dependentToo = TestHandler::createTask('dependent too', dependsOn: new TaskCollection($dependent));
 
+    $continues = TestHandler::createTask(
+        'continues',
+        dependsOn: new TaskCollection($slow),
+        onDependencyFailure: DependencyFailurePolicy::CONTINUE
+    );
+
+    $alsoSlow = TestHandler::createTask('also slow', leaseSeconds: 60);
+    $added = $queue->enqueue($slow, $dependent, $dependentToo, $continues, $alsoSlow);
+
+    // As if two workers claimed them and stopped, without saying how they went.
+    $store = $queue->getStore();
+    $claimed = $store->claimNext(['tests'], [TestHandler::TYPE], 'gone');
+    SmokeTest::assertSame(1, $claimed->count(), "the tasks claimed");
+    $slowTask = $claimed->first();
+    SmokeTest::assertSame($added->first()->getId(), $slowTask->getId(), "the task claimed");
+    $alsoSlowTask = $store->claimNext(['tests'], [TestHandler::TYPE], 'gone too')->first();
+    SmokeTest::assertSame('also slow', $getLabel($alsoSlowTask), "the second task claimed");
+    SmokeTest::assertSame(TaskStatus::RUNNING, $queue->fetch($slowTask->getId())->getStatus(), "its status");
+
+    // Extending a lease keeps it going.
     $clock->advance(50);
-    $context->extendLease(600);
+    $queue->extendLease($slowTask, 600);
+    $queue->extendLease($alsoSlowTask, 600);
     $clock->advance(500);
-    SmokeTest::assertSame(0, $queue->recoverExpiredLeases(), "tasks recovered within the extended lease");
+    $handler = new TestHandler(TestDatabase::get());
+    $worker = new Worker($queue, ['tests'], $handler);
+    SmokeTest::assertSame(false, $worker->runNext(), "whether there was anything to run, within the leases");
 
-    $extendTooFar = function () use ($context) : void {
-        $context->extendLease(86401);
-    };
-
-    SmokeTest::expectException(\InvalidArgumentException::class, $extendTooFar);
+    // Once they've run out, both are removed with their dependents, and thrown together.
     $clock->advance(101);
-    SmokeTest::assertSame(1, $queue->recoverExpiredLeases(), "tasks recovered after the extended lease ran out");
 
-    $extendLost = function () use ($context) : void {
-        $context->extendLease(60);
+    try
+    {
+        $worker->runNext();
+        throw new \Exception("The expired tasks should have been thrown.");
+    }
+    catch (ExceptionTasksExpired $expiry)
+    {
+        $expired = $expiry->getExpiredTasks();
+        SmokeTest::assertSame(2, $expired->count(), "the tasks expired");
+        SmokeTest::assertSame('slow', $getLabel($expired->get(0)->getTask()), "the first expired task");
+        $removed = $expired->get(0)->getDependents()->map($getLabel);
+        SmokeTest::assertSame(['dependent', 'dependent too'], $removed, "those removed with it");
+        SmokeTest::assertSame('also slow', $getLabel($expired->get(1)->getTask()), "the second expired task");
+        SmokeTest::assertSame(0, $expired->get(1)->getDependents()->count(), "those removed with it");
+    }
+
+    // Nothing ran then. The one that continues anyway was left in the queue, and runs next.
+    SmokeTest::assertSame([], $handler->getHandled(), "what ran while they were removed");
+    SmokeTest::assertSame(true, $worker->runNext(), "whether the released task ran");
+    SmokeTest::assertSame(['continues'], $handler->getHandled(), "what ran");
+    SmokeTest::assertSame(0, TestDatabase::countTasks(), "the tasks left");
+
+    // They can be put back as they were, with their links kept.
+    $first = $expiry->getExpiredTasks()->get(0);
+    $again = $queue->enqueue($first->getTask(), ...$first->getDependents()->toArray());
+    $link = $again->get(1)->getDependsOnIds()->toArray();
+    SmokeTest::assertSame([$again->get(0)->getId()], $link, "the dependent's link");
+
+    $extendGone = function () use ($queue, $slowTask) : void {
+        $queue->extendLease($slowTask, 60);
     };
 
-    SmokeTest::expectException(\Programster\PgsqlTaskQueue\Exceptions\ExceptionLeaseLost::class, $extendLost);
+    SmokeTest::expectException(ExceptionTaskNotFound::class, $extendGone);
 };
 
-$smoke->run("worker: a handler can extend its task's lease, until it has lost it", $extendLease);
-
-$stopConditions = function () : void {
-    $clock = new FakeClock();
-    $queue = Fixtures::createQueue($clock);
-
-    for ($i = 1; $i <= 3; $i++)
-    {
-        $queue->enqueue(Fixtures::createTask("task {$i}"));
-    }
-
-    $log = new HandledLog();
-    $reason = Fixtures::createWorker($queue, $clock, $log, maxTasks: 2)->run();
-    SmokeTest::assertSame(WorkerStopReason::TASK_LIMIT, $reason, "why it stopped");
-    SmokeTest::assertSame(2, count($log->getEntries()), "tasks run");
-
-    $batch = $queue->createBatch('run');
-    $queue->enqueue(Fixtures::createTask('in batch'), $batch);
-    $handler = new TestTaskHandler($log, $clock, $queue, TestDatabase::get());
-
-    $worker = $queue->createWorker(
-        new TaskHandlerCollection($handler),
-        new QueueNameCollection(new QueueName(Fixtures::QUEUE)),
-        stopConditions: new WorkerStopConditions(untilBatchFinished: $batch),
-        pollSeconds: 0.05
-    );
-
-    SmokeTest::assertSame(WorkerStopReason::BATCH_FINISHED, $worker->run(), "why it stopped, with a batch");
-
-    $worker = $queue->createWorker(
-        new TaskHandlerCollection($handler),
-        new QueueNameCollection(new QueueName(Fixtures::QUEUE)),
-        stopConditions: new WorkerStopConditions(maxSeconds: 1),
-        pollSeconds: 0.05
-    );
-
-    $startedAt = microtime(true);
-    SmokeTest::assertSame(WorkerStopReason::TIME_LIMIT, $worker->run(), "why it stopped, with a time limit");
-    assert(microtime(true) - $startedAt < 2, "It stopped soon after its time limit.");
-
-    $worker = $queue->createWorker(
-        new TaskHandlerCollection($handler),
-        new QueueNameCollection(new QueueName(Fixtures::QUEUE)),
-        stopConditions: new WorkerStopConditions(maxMemoryBytes: 1),
-        pollSeconds: 0.05
-    );
-
-    SmokeTest::assertSame(WorkerStopReason::MEMORY_LIMIT, $worker->run(), "why it stopped, with a memory limit");
-};
-
-$smoke->run("worker: it stops after its task, time or memory limit, or once its batch has finished", $stopConditions);
-
-$signalStops = function () : void {
-    if (!function_exists('pcntl_async_signals') || !function_exists('posix_kill'))
-    {
-        throw new \Exception("This test needs the pcntl and posix extensions.");
-    }
-
-    $clock = new FakeClock();
-    $queue = Fixtures::createQueue($clock);
-    $queue->enqueue(Fixtures::createTask('stopper', TestTaskBehaviour::STOP_WORKER));
-    $queue->enqueue(Fixtures::createTask('after'));
-    $handler = new TestTaskHandler(new HandledLog(), $clock, $queue, TestDatabase::get());
-
-    $worker = $queue->createWorker(
-        new TaskHandlerCollection($handler),
-        new QueueNameCollection(new QueueName(Fixtures::QUEUE)),
-        pollSeconds: 0.05
-    );
-
-    $before = pcntl_signal_get_handler(SIGTERM);
-    SmokeTest::assertSame(WorkerStopReason::STOPPED, $worker->run(), "why it stopped");
-    SmokeTest::assertSame(TaskStatus::SUCCEEDED, $queue->fetchTask(1)->getStatus(), "the task it was on");
-    SmokeTest::assertSame(TaskStatus::WAITING, $queue->fetchTask(2)->getStatus(), "the next task");
-    SmokeTest::assertSame($before, pcntl_signal_get_handler(SIGTERM), "the SIGTERM handler, put back");
-};
-
-$smoke->run("worker: SIGTERM stops it once it has finished the task it's on", $signalStops);
+$smoke->run("worker: tasks whose leases ran out are removed with their dependents, and thrown", $expiredLeases);
 
 $badWorkers = function () : void {
-    $clock = new FakeClock();
-    $queue = Fixtures::createQueue($clock);
-    $handler = new TestTaskHandler(new HandledLog(), $clock, $queue, TestDatabase::get());
-    $queues = new QueueNameCollection(new QueueName(Fixtures::QUEUE));
+    TestDatabase::reset();
+    $queue = new TaskQueue(TestDatabase::get(), new FakeClock(), TestDatabase::SCHEMA);
+    $handler = new TestHandler(TestDatabase::get());
 
-    $badCreations = [
-        'no handlers' => function () use ($queue, $queues) : void {
-            $queue->createWorker(new TaskHandlerCollection(), $queues);
-        },
-        'no queues' => function () use ($queue, $handler) : void {
-            $queue->createWorker(new TaskHandlerCollection($handler), new QueueNameCollection());
-        },
-        'two handlers for one class' => function () use ($queue, $handler, $queues) : void {
-            $queue->createWorker(new TaskHandlerCollection($handler, $handler), $queues);
-        },
-        'a poll time of 0' => function () use ($queue, $handler, $queues) : void {
-            $queue->createWorker(new TaskHandlerCollection($handler), $queues, pollSeconds: 0);
-        },
-    ];
+    $badQueues = [[], [''], [' '], [1]];
 
-    foreach ($badCreations as $what => $create)
+    foreach ($badQueues as $queues)
     {
+        $create = function () use ($queue, $queues, $handler) : void {
+            new Worker($queue, $queues, $handler);
+        };
+
         SmokeTest::expectException(\InvalidArgumentException::class, $create);
     }
+
+    $noHandlers = function () use ($queue) : void {
+        new Worker($queue, ['tests']);
+    };
+
+    SmokeTest::expectException(\InvalidArgumentException::class, $noHandlers);
+
+    $twoForAType = function () use ($queue, $handler) : void {
+        new Worker($queue, ['tests'], $handler, new TestHandler(TestDatabase::get()));
+    };
+
+    SmokeTest::expectException(\InvalidArgumentException::class, $twoForAType, "Two handlers");
 };
 
-$smoke->run("worker: one can't be created without handlers or queues, or with two handlers for a class", $badWorkers);
-
-$otherClassesAndQueues = function () : void {
-    $clock = new FakeClock();
-    $queue = Fixtures::createQueue($clock);
-    $inOtherQueue = new \Programster\PgsqlTaskQueue\NewTask(
-        new \Programster\PgsqlTaskQueue\Testing\TestTask('elsewhere'),
-        new QueueName('other')
-    );
-
-    $queue->enqueue($inOtherQueue);
-    $log = new HandledLog();
-    Fixtures::createWorker($queue, $clock, $log)->run();
-    SmokeTest::assertSame([], $log->getEntries(), "tasks run from a queue the worker doesn't take from");
-};
-
-$smoke->run("worker: it only takes tasks from its own queues", $otherClassesAndQueues);
-
-$deleteOld = function () : void {
-    $clock = new FakeClock();
-    $queue = Fixtures::createQueue($clock);
-    $batch = $queue->createBatch('old run');
-    $queue->enqueue(Fixtures::createTask('old'), $batch);
-    $queue->enqueue(Fixtures::createTask('dies', TestTaskBehaviour::FAIL_PERMANENTLY));
-    Fixtures::createWorker($queue, $clock, new HandledLog())->run();
-    $clock->advance(86400);
-    $queue->enqueue(Fixtures::createTask('unfinished'));
-    $clock->advance(86400);
-    $queue->enqueue(Fixtures::createTask('recent'));
-    Fixtures::createWorker($queue, $clock, new HandledLog(), maxTasks: 1)->run();
-
-    SmokeTest::assertSame(2, $queue->deleteFinishedBefore($clock->now()->modify('-1 hour')), "tasks deleted");
-    $remaining = TestDatabase::get()->query("SELECT count(*) FROM task_queue_test.task");
-    SmokeTest::assertSame('2', pg_fetch_result($remaining, 0, 0), "tasks left");
-    $batches = TestDatabase::get()->query("SELECT count(*) FROM task_queue_test.batch");
-    SmokeTest::assertSame('0', pg_fetch_result($batches, 0, 0), "batches left");
-};
-
-$smoke->run("worker: finished tasks older than a time can be deleted, with their empty batches", $deleteOld);
+$smoke->run("worker: one needs queues and handlers, and one handler for each type", $badWorkers);

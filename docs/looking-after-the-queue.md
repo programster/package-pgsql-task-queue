@@ -1,82 +1,53 @@
 # Looking after the queue
 
-- [Installing and upgrading the tables](#installing-and-upgrading-the-tables)
-- [Adding tasks in your own transactions](#adding-tasks-in-your-own-transactions)
-- [Admin pages](#admin-pages)
-- [Deleting old tasks](#deleting-old-tasks)
-- [The clock](#the-clock)
+- [Creating the tables](#creating-the-tables)
+- [Adding tasks in your own transaction](#adding-tasks-in-your-own-transaction)
+- [Reading and cancelling tasks](#reading-and-cancelling-tasks)
 
-## Installing and upgrading the tables
-`TaskQueueSchema::migrate()` creates the queue's tables, or brings them up to date after an upgrade, so run it
-wherever you run your own migrations (e.g. when your container starts). They go in a schema of their own
-(`task_queue` by default), with their own migration version (in `task_queue.migrations`, using
-`programster/pgsql-migrations`), so they never clash with your tables or migrations.
+## Creating the tables
+The queue's tables go in a schema of their own (`task_queue`, unless you give another), so they never clash with
+yours. The package has no migrations of its own. Either let it create them, if they don't exist, e.g. when the
+application starts:
 
 ```php
 use Programster\PgsqlLib\PgSqlConnection;
 
-$connection = PgSqlConnection::create('localhost', 'myapp', 'myapp', 'secret', forceNew: true);
-TaskQueueSchema::migrate($connection);
+$connection = PgSqlConnection::create('localhost', 'app', 'app', 'secret');
+TaskQueue::createTables($connection);
+TaskQueue::createTables($connection); // Safe to run again.
 ```
 
-To use another schema (e.g. two separate queues in one database), give it to both `migrate()` and `TaskQueue`, as
-`migrate($connection, 'reports_queue')` and `new TaskQueue($connection, $clock, 'reports_queue')`. Run `migrate()`
-once per process, as its migrations are loaded from their files the first time.
-
-## Adding tasks in your own transactions
-If the connection is already in a transaction, adding tasks happens within it (in a savepoint), so the tasks only
-exist if your transaction commits. That way, a task is never left behind for a change that was rolled back, nor a
-change made without its task:
+Or put its SQL in your own migrations:
 
 ```php
-final readonly class SendReceipt implements TaskInterface
-{
-    public static function createFromArray(array $data) : static
-    {
-        return new SendReceipt();
-    }
+$sql = TaskQueue::getCreateTablesSql('jobs');
+assert(str_contains($sql, 'CREATE TABLE IF NOT EXISTS "jobs".task ('));
+```
 
-    public function jsonSerialize() : array
-    {
-        return [];
-    }
-}
+A queue in another schema is given it too: `new TaskQueue($connection, null, 'jobs')`. The tables only hold tasks
+still to run: a task is removed once it's handled, or has failed, so they stay small, and there's nothing to clear out.
 
-$queue = new TaskQueue($connection, new SystemClock());
+## Adding tasks in your own transaction
+If the connection is already in a transaction, the tasks are added in a savepoint within it, so they're only kept if
+it's committed, e.g. a welcome email is only sent for a member who was saved:
+
+```php
+$queue = new TaskQueue($connection);
 $connection->query('BEGIN');
-// ... record the payment ...
-$queue->enqueue(new NewTask(new SendReceipt(), new QueueName('emails')));
-$connection->query('COMMIT');
+// ... save the member.
+$queue->enqueue(Task::create('send-welcome-email', ['memberId' => 42], group: 'member-42'));
+$connection->query('ROLLBACK');
+assert($queue->fetchGroup('member-42')->count() === 0);
 ```
 
-## Admin pages
-The queue keeps each task's status, attempts, timings, result, output and error, for an admin page to show:
+## Reading and cancelling tasks
+`fetch()` returns a task by its ID, as it is now (throwing `ExceptionTaskNotFound` once it's gone), and `fetchGroup()`
+the tasks still in a group. `delete()` cancels a task as if it had failed: the tasks depending on it follow their
+`DependencyFailurePolicy`, and those removed with it are returned.
 
 ```php
-$recentlyDead = $queue->fetchPage(TaskStatus::DEAD, new QueueName('emails'), limit: 50);
-
-foreach ($recentlyDead as $task)
-{
-    echo "{$task->getId()}: {$task->getError()}, after {$task->getAttempts()} attempts\n";
-}
-
-$receipt = $queue->fetchTask(1);
-assert($receipt->getStatus() === TaskStatus::WAITING);
+$report = $queue->enqueue(Task::create('build-report', [], group: 'monthly'))->first();
+assert($queue->fetch($report->getId())->getStatus() === TaskStatus::WAITING);
+$removed = $queue->delete($report);
+assert($removed->count() === 0 && $queue->fetchGroup('monthly')->count() === 0);
 ```
-
-`retry()` runs a dead task again (see [Retries and failures](retries-and-failures.md#retrying-a-dead-task)).
-
-## Deleting old tasks
-Finished tasks stay until they're deleted, so delete them every so often (e.g. daily, from a task of their own),
-keeping as long as is useful. `deleteFinishedBefore()` deletes the tasks that succeeded, died or were skipped before a
-time, and the batches made before then that have no tasks left. Unfinished tasks are never deleted.
-
-```php
-$numDeleted = $queue->deleteFinishedBefore(new DateTimeImmutable('-30 days'));
-```
-
-## The clock
-Every time the queue records (when a task was added, became due, started, finished, or its lease runs out) comes from
-the PSR-20 clock it's given, never the database's `now()`. `SystemClock` gives the real time, in UTC. An application
-with a clock of its own (e.g. one an admin can move forward, to test what happens next month) gives the queue that
-clock, so delays, retries and leases follow it too.
