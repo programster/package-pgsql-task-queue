@@ -1,5 +1,10 @@
 # Upgrading
 
+## 1.0.0-alpha4
+- Fixes `fetchWithData($type, [])`, which didn't find the tasks of the type whose data is empty, or a list (as `{}`,
+  which it looked for, isn't contained in a list). An empty array now matches every task of the type, as documented.
+  Nothing to change when upgrading.
+
 ## 1.0.0-alpha3
 - Adds `TaskQueue::fetchWithData($type, $data)`, to find tasks by what their data contains (JSONB containment).
 - Adds a GIN index on the tasks' data, which `TaskQueue::createTables()` adds to existing tables (it creates only what

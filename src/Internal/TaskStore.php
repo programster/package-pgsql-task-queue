@@ -366,9 +366,20 @@ final readonly class TaskStore
     public function fetchWithData(string $type, array $data) : TaskCollection
     {
         $columns = self::TASK_COLUMNS;
-        $query = "SELECT {$columns} FROM {$this->m_taskTable} WHERE type = $1 AND data @> $2::jsonb ORDER BY seq";
-        $encoded = (count($data) === 0) ? '{}' : json_encode($data, JSON_THROW_ON_ERROR);
-        $result = $this->m_connection->query($query, [$type, $encoded]);
+
+        // With no data to look for, every task of the type matches, whether its data is an object or a list (which
+        // {} wouldn't contain).
+        if (count($data) === 0)
+        {
+            $query = "SELECT {$columns} FROM {$this->m_taskTable} WHERE type = $1 ORDER BY seq";
+            $result = $this->m_connection->query($query, [$type]);
+        }
+        else
+        {
+            $query = "SELECT {$columns} FROM {$this->m_taskTable} WHERE type = $1 AND data @> $2::jsonb ORDER BY seq";
+            $result = $this->m_connection->query($query, [$type, json_encode($data, JSON_THROW_ON_ERROR)]);
+        }
+
         $tasks = [];
 
         while (($row = pg_fetch_assoc($result)) !== false)

@@ -208,6 +208,7 @@ $withData = function () use ($getLabel) : void {
     $chaser = ['label' => 'chaser', 'reference' => ['subscriptionId' => 12, 'templateId' => 3], 'tags' => ['a', 'b']];
     $other = ['label' => 'other', 'reference' => ['subscriptionId' => 13, 'templateId' => 3], 'tags' => ['b']];
     $queue->enqueue(Task::create('email', $chaser), Task::create('email', $other), Task::create('job', $chaser));
+    $queue->enqueue(Task::create('no-data', []), Task::create('list', ['a', 'b']));
 
     $find = function (string $type, array $data) use ($queue, $getLabel) : array {
         return $queue->fetchWithData($type, $data)->map($getLabel);
@@ -219,6 +220,11 @@ $withData = function () use ($getLabel) : void {
     SmokeTest::assertSame(['chaser'], $find('job', []), "another type");
     SmokeTest::assertSame([], $find('email', ['reference' => ['subscriptionId' => '12']]), "a value of another type");
     SmokeTest::assertSame([], $find('missing', []), "a type with no tasks");
+
+    // Every task of a type, even one whose data is empty, or a list, which {} wouldn't contain.
+    SmokeTest::assertSame(1, $queue->fetchWithData('no-data', [])->count(), "the tasks with no data");
+    SmokeTest::assertSame(1, $queue->fetchWithData('list', [])->count(), "the tasks whose data is a list");
+    SmokeTest::assertSame(1, $queue->fetchWithData('list', ['b'])->count(), "the lists containing an element");
 
     $badData = function () use ($queue) : void {
         $queue->fetchWithData('email', ['bad' => NAN]);
