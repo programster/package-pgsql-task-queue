@@ -3,6 +3,7 @@
 - [Creating the tables](#creating-the-tables)
 - [Adding tasks in your own transaction](#adding-tasks-in-your-own-transaction)
 - [Reading and cancelling tasks](#reading-and-cancelling-tasks)
+- [Finding tasks by their data](#finding-tasks-by-their-data)
 
 ## Creating the tables
 The queue's tables go in a schema of their own (`task_queue`, unless you give another), so they never clash with
@@ -51,3 +52,21 @@ assert($queue->fetch($report->getId())->getStatus() === TaskStatus::WAITING);
 $removed = $queue->delete($report);
 assert($removed->count() === 0 && $queue->fetchGroup('monthly')->count() === 0);
 ```
+
+## Finding tasks by their data
+`fetchWithData()` returns the tasks of a type whose data contains what's given, using PostgreSQL's JSONB
+containment (`@>`, with a GIN index): each key given must be in the task's data with the same value (and the same type,
+so `12` doesn't match `"12"`), and nested objects and lists only need to contain what's given. It's useful for
+avoiding duplicates, e.g. not queueing a reminder that's already waiting:
+
+```php
+$reminder = ['memberId' => 42, 'template' => 'renewal'];
+$queue->enqueue(Task::create('send-reminder', $reminder));
+$isWaiting = !$queue->fetchWithData('send-reminder', ['memberId' => 42])->isEmpty();
+assert($isWaiting);
+assert($queue->fetchWithData('send-reminder', [])->count() === 1); // Every task of the type.
+```
+
+Checking and then enqueueing aren't one atomic step, so if several processes could queue the same thing at once, make
+only one of them do it (e.g. one scheduler), or hold a lock of your own around both.
+

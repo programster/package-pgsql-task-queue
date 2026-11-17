@@ -23,7 +23,7 @@ suite) to run in parallel.
 - **Workers that stop partway through:** each task has a lease. If its worker dies, the task is removed (with its
   dependents) once the lease runs out, rather than run twice, and the worker throws, saying so.
 - **Priorities, delays and groups:** higher priorities go first, a task can wait until a time, and tasks can share a
-  group name (e.g. a UUID for a test run) to be fetched together.
+  group name (e.g. a UUID for a test run) to be fetched together, or be found by what their data contains.
 - **Starts straight away:** an idle worker is woken by `NOTIFY` as soon as a task is added or finishes.
 
 Everything else is left to the application: a handled task is simply removed, and when one fails, the worker throws

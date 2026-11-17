@@ -202,3 +202,29 @@ $groupsAndDelete = function () use ($getLabel) : void {
 };
 
 $smoke->run("queue: a group's tasks can be fetched, and deleting one follows its dependents' policy", $groupsAndDelete);
+
+$withData = function () use ($getLabel) : void {
+    $queue = queueTestCreateQueue(new FakeClock());
+    $chaser = ['label' => 'chaser', 'reference' => ['subscriptionId' => 12, 'templateId' => 3], 'tags' => ['a', 'b']];
+    $other = ['label' => 'other', 'reference' => ['subscriptionId' => 13, 'templateId' => 3], 'tags' => ['b']];
+    $queue->enqueue(Task::create('email', $chaser), Task::create('email', $other), Task::create('job', $chaser));
+
+    $find = function (string $type, array $data) use ($queue, $getLabel) : array {
+        return $queue->fetchWithData($type, $data)->map($getLabel);
+    };
+
+    SmokeTest::assertSame(['chaser'], $find('email', ['reference' => ['subscriptionId' => 12]]), "by a nested key");
+    SmokeTest::assertSame(['chaser', 'other'], $find('email', ['tags' => ['b']]), "by a list element");
+    SmokeTest::assertSame(['chaser', 'other'], $find('email', []), "every task of the type");
+    SmokeTest::assertSame(['chaser'], $find('job', []), "another type");
+    SmokeTest::assertSame([], $find('email', ['reference' => ['subscriptionId' => '12']]), "a value of another type");
+    SmokeTest::assertSame([], $find('missing', []), "a type with no tasks");
+
+    $badData = function () use ($queue) : void {
+        $queue->fetchWithData('email', ['bad' => NAN]);
+    };
+
+    SmokeTest::expectException(\InvalidArgumentException::class, $badData, "JSON");
+};
+
+$smoke->run("queue: tasks can be found by what their data contains", $withData);

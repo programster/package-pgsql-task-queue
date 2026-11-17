@@ -103,6 +103,9 @@ final readonly class TaskQueue
                 WHERE lease_expires_at IS NOT NULL;
 
             CREATE INDEX IF NOT EXISTS task_group_idx ON {$s}.task (group_name) WHERE group_name IS NOT NULL;
+
+            -- Finding tasks by their data (fetchWithData()).
+            CREATE INDEX IF NOT EXISTS task_data_idx ON {$s}.task USING GIN (data jsonb_path_ops);
             SQL;
     }
 
@@ -191,6 +194,36 @@ final readonly class TaskQueue
     public function fetchGroup(string $group) : TaskCollection
     {
         return $this->m_store->fetchGroup($group);
+    }
+
+
+    /**
+     * Fetch the tasks still in the queue of a type whose data contains the data given, oldest first, using JSONB
+     * containment (as PostgreSQL's @> does): every key given must be in the task's data with the same value, and a
+     * nested object or list given must be contained in the task's. E.g. to see whether an email to a subscription is
+     * already waiting, before queueing another.
+     *
+     * @param string $type - the type of task, e.g. "send-email".
+     *
+     * @param array<mixed> $data - what the data must contain, e.g. ['subscriptionId' => 12]. An empty array matches
+     * every task of the type.
+     *
+     * @return TaskCollection
+     *
+     * @throws \InvalidArgumentException - if $data can't be encoded as JSON.
+     */
+    public function fetchWithData(string $type, array $data) : TaskCollection
+    {
+        try
+        {
+            $tasks = $this->m_store->fetchWithData($type, $data);
+        }
+        catch (\JsonException $exception)
+        {
+            throw new \InvalidArgumentException("The data to look for must be encodable as JSON.", 0, $exception);
+        }
+
+        return $tasks;
     }
 
 

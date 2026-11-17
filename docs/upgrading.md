@@ -1,5 +1,11 @@
 # Upgrading
 
+## 1.0.0-alpha3
+- Adds `TaskQueue::fetchWithData($type, $data)`, to find tasks by what their data contains (JSONB containment).
+- Adds a GIN index on the tasks' data, which `TaskQueue::createTables()` adds to existing tables (it creates only what
+  doesn't exist). If you use `getCreateTablesSql()` in your own migrations, add a migration that runs it again, or just
+  the new `CREATE INDEX IF NOT EXISTS task_data_idx ...` statement.
+
 ## 1.0.0-alpha2
 A rewrite, cutting the package down to its one job: scheduling tasks, which may depend on others, for workers to take
 and run. It has 9 public classes instead of 26. There's no upgrade path for alpha1's tables: drop the `task_queue`

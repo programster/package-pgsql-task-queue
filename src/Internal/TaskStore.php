@@ -355,6 +355,32 @@ final readonly class TaskStore
 
 
     /**
+     * Fetch the tasks of a type whose data contains the data given (JSONB containment), oldest first.
+     *
+     * @param string $type
+     *
+     * @param array<mixed> $data - e.g. ['subscriptionId' => 12], or [] for every task of the type.
+     *
+     * @return TaskCollection
+     */
+    public function fetchWithData(string $type, array $data) : TaskCollection
+    {
+        $columns = self::TASK_COLUMNS;
+        $query = "SELECT {$columns} FROM {$this->m_taskTable} WHERE type = $1 AND data @> $2::jsonb ORDER BY seq";
+        $encoded = (count($data) === 0) ? '{}' : json_encode($data, JSON_THROW_ON_ERROR);
+        $result = $this->m_connection->query($query, [$type, $encoded]);
+        $tasks = [];
+
+        while (($row = pg_fetch_assoc($result)) !== false)
+        {
+            $tasks[] = Task::createFromRow($row, $this->fetchDependsOnIds((string)$row['id']));
+        }
+
+        return new TaskCollection(...$tasks);
+    }
+
+
+    /**
      * Start listening for the notifications sent when tasks are added or finish, for waitForNotification().
      */
     public function listen() : void
