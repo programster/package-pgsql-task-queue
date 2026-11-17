@@ -50,7 +50,7 @@ final readonly class TaskQueueSchema
         }
         finally
         {
-            $connection->queryWithParams("SELECT set_config('search_path', $1, false)", [$previousSearchPath]);
+            $connection->query("SELECT set_config('search_path', $1, false)", [$previousSearchPath]);
         }
     }
 }

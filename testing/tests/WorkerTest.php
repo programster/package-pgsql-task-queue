@@ -166,7 +166,7 @@ $retryDeadUnskips = function () : void {
     // Make it succeed this time, then retry it.
     $succeedPayload = '{"label": "a", "behaviour": "succeed", "sleepMs": 0}';
     $update = 'UPDATE task_queue_test.task SET payload = $1 WHERE id = $2';
-    TestDatabase::get()->queryWithParams($update, [$succeedPayload, $queued->get(0)->getId()]);
+    TestDatabase::get()->query($update, [$succeedPayload, $queued->get(0)->getId()]);
     $queue->retry($queued->get(0)->getId());
     $c = $queue->fetchTask($queued->get(3)->getId());
     SmokeTest::assertSame(TaskStatus::BLOCKED, $c->getStatus(), "c's status, un-skipped");

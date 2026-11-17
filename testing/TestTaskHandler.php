@@ -117,10 +117,10 @@ final readonly class TestTaskHandler implements TaskHandlerInterface
             SQL;
 
         $params = [$task->getLabel(), $context->getWorker(), $context->getAttempt()];
-        $id = (int)pg_fetch_result($this->m_connection->queryWithParams($insert, $params), 0, 0);
+        $id = (int)pg_fetch_result($this->m_connection->query($insert, $params), 0, 0);
         $sleepMs = ($task->getBehaviour() === TestTaskBehaviour::HANG) ? 60000 : $task->getSleepMs();
         usleep($sleepMs * 1000);
         $update = 'UPDATE public.test_run SET finished_at = clock_timestamp() WHERE id = $1';
-        $this->m_connection->queryWithParams($update, [$id]);
+        $this->m_connection->query($update, [$id]);
     }
 }

@@ -102,7 +102,7 @@ final readonly class TaskStore
         }
 
         $query = "INSERT INTO {$this->m_batchTable} (name, created_at) VALUES ($1, $2) RETURNING id, name, created_at";
-        $result = $this->m_connection->queryWithParams($query, [$name, $this->fetchNowAsText()]);
+        $result = $this->m_connection->query($query, [$name, $this->fetchNowAsText()]);
         return Batch::createFromRow(self::fetchOneRow($result));
     }
 
@@ -110,7 +110,7 @@ final readonly class TaskStore
     public function fetchBatch(int $id) : Batch
     {
         $query = "SELECT id, name, created_at FROM {$this->m_batchTable} WHERE id = $1";
-        $row = pg_fetch_assoc($this->m_connection->queryWithParams($query, [$id]));
+        $row = pg_fetch_assoc($this->m_connection->query($query, [$id]));
 
         if ($row === false)
         {
@@ -227,7 +227,7 @@ final readonly class TaskStore
             SqlValues::formatTextArray($taskClasses),
         ];
 
-        $result = $this->m_connection->queryWithParams($query, $params);
+        $result = $this->m_connection->query($query, $params);
         $row = pg_fetch_assoc($result);
 
         if ($row === false)
@@ -265,7 +265,7 @@ final readonly class TaskStore
             SQL;
 
         $params = [...self::getOwnerParams($claimed), $this->fetchNowAsText(), $seconds];
-        $this->assertStillHeld($claimed, $this->m_connection->queryWithParams($query, $params));
+        $this->assertStillHeld($claimed, $this->m_connection->query($query, $params));
     }
 
 
@@ -294,7 +294,7 @@ final readonly class TaskStore
                 $result->getOutput(),
             ];
 
-            $this->assertStillHeld($claimed, $this->m_connection->queryWithParams($query, $params));
+            $this->assertStillHeld($claimed, $this->m_connection->query($query, $params));
             $this->releaseDependents($claimed->getTask()->getId());
             $this->notify();
         };
@@ -351,7 +351,7 @@ final readonly class TaskStore
             }
 
             $params = [...self::getOwnerParams($claimed), $time, $durationMs, $error];
-            $this->assertStillHeld($claimed, $this->m_connection->queryWithParams($query, $params));
+            $this->assertStillHeld($claimed, $this->m_connection->query($query, $params));
 
             if (!$willRetry)
             {
@@ -382,7 +382,7 @@ final readonly class TaskStore
             SQL;
 
         $params = [...self::getOwnerParams($claimed), SqlValues::formatTimestamp($until), $reason];
-        $this->assertStillHeld($claimed, $this->m_connection->queryWithParams($query, $params));
+        $this->assertStillHeld($claimed, $this->m_connection->query($query, $params));
     }
 
 
@@ -403,7 +403,7 @@ final readonly class TaskStore
                 SQL;
 
             $now = $this->fetchNowAsText();
-            $result = $this->m_connection->queryWithParams($query, [$now]);
+            $result = $this->m_connection->query($query, [$now]);
             $numRecovered = 0;
 
             while (($row = pg_fetch_assoc($result)) !== false)
@@ -437,7 +437,7 @@ final readonly class TaskStore
     {
         $retry = function () use ($id) : void {
             $selectQuery = "SELECT status FROM {$this->m_taskTable} WHERE id = $1 FOR UPDATE";
-            $row = pg_fetch_assoc($this->m_connection->queryWithParams($selectQuery, [$id]));
+            $row = pg_fetch_assoc($this->m_connection->query($selectQuery, [$id]));
 
             if ($row === false)
             {
@@ -456,7 +456,7 @@ final readonly class TaskStore
                 WHERE id = $1
                 SQL;
 
-            $this->m_connection->queryWithParams($retryQuery, [$id, $this->fetchNowAsText()]);
+            $this->m_connection->query($retryQuery, [$id, $this->fetchNowAsText()]);
 
             $unskipQuery = <<<SQL
                 UPDATE {$this->m_taskTable} AS t
@@ -469,7 +469,7 @@ final readonly class TaskStore
                 WHERE t.skipped_because_id = $1 AND t.status = 'skipped'
                 SQL;
 
-            $this->m_connection->queryWithParams($unskipQuery, [$id]);
+            $this->m_connection->query($unskipQuery, [$id]);
             $this->notify();
         };
 
@@ -481,7 +481,7 @@ final readonly class TaskStore
     {
         $columns = self::TASK_COLUMNS;
         $query = "SELECT {$columns} FROM {$this->m_taskTable} WHERE id = $1";
-        $row = pg_fetch_assoc($this->m_connection->queryWithParams($query, [$id]));
+        $row = pg_fetch_assoc($this->m_connection->query($query, [$id]));
 
         if ($row === false)
         {
@@ -496,7 +496,7 @@ final readonly class TaskStore
     {
         $columns = self::TASK_COLUMNS;
         $query = "SELECT {$columns} FROM {$this->m_taskTable} WHERE batch_id = $1 ORDER BY id";
-        return self::createTasks($this->m_connection->queryWithParams($query, [$batch->getId()]));
+        return self::createTasks($this->m_connection->query($query, [$batch->getId()]));
     }
 
 
@@ -517,7 +517,7 @@ final readonly class TaskStore
             SQL;
 
         $params = [$status, $queue->getName(), $limit, $offset];
-        return self::createTasks($this->m_connection->queryWithParams($query, $params));
+        return self::createTasks($this->m_connection->query($query, $params));
     }
 
 
@@ -525,7 +525,7 @@ final readonly class TaskStore
     {
         $unfinished = self::UNFINISHED;
         $query = "SELECT 1 FROM {$this->m_taskTable} WHERE batch_id = $1 AND status IN {$unfinished} LIMIT 1";
-        return (pg_num_rows($this->m_connection->queryWithParams($query, [$batch->getId()])) === 0);
+        return (pg_num_rows($this->m_connection->query($query, [$batch->getId()])) === 0);
     }
 
 
@@ -544,14 +544,14 @@ final readonly class TaskStore
                 WHERE status IN ('succeeded', 'dead', 'skipped') AND finished_at < $1
                 SQL;
 
-            $numDeleted = pg_affected_rows($this->m_connection->queryWithParams($taskQuery, [$time]));
+            $numDeleted = pg_affected_rows($this->m_connection->query($taskQuery, [$time]));
 
             $batchQuery = <<<SQL
                 DELETE FROM {$this->m_batchTable} AS b
                 WHERE b.created_at < $1 AND NOT EXISTS (SELECT 1 FROM {$this->m_taskTable} AS t WHERE t.batch_id = b.id)
                 SQL;
 
-            $this->m_connection->queryWithParams($batchQuery, [$time]);
+            $this->m_connection->query($batchQuery, [$time]);
             return $numDeleted;
         };
 
@@ -703,7 +703,7 @@ final readonly class TaskStore
                 FOR SHARE
                 SQL;
 
-            $result = $this->m_connection->queryWithParams($query, [SqlValues::formatIntArray($dependencyIds)]);
+            $result = $this->m_connection->query($query, [SqlValues::formatIntArray($dependencyIds)]);
 
             if (pg_num_rows($result) !== count($dependencyIds))
             {
@@ -785,7 +785,7 @@ final readonly class TaskStore
             $skippedBecauseId,
         ];
 
-        $row = pg_fetch_assoc($this->m_connection->queryWithParams($insertQuery, $params));
+        $row = pg_fetch_assoc($this->m_connection->query($insertQuery, $params));
 
         if ($row === false)
         {
@@ -803,7 +803,7 @@ final readonly class TaskStore
                     SQL;
 
                 $dependencyParams = [$queued->getId(), SqlValues::formatIntArray($dependencyIds)];
-                $this->m_connection->queryWithParams($dependencyQuery, $dependencyParams);
+                $this->m_connection->query($dependencyQuery, $dependencyParams);
             }
         }
 
@@ -828,7 +828,7 @@ final readonly class TaskStore
             SQL;
 
         $params = [$task->getQueue()->getName(), $task->getOptions()->getDeduplicationKey()];
-        $row = pg_fetch_assoc($this->m_connection->queryWithParams($query, $params));
+        $row = pg_fetch_assoc($this->m_connection->query($query, $params));
 
         if ($row === false)
         {
@@ -855,7 +855,7 @@ final readonly class TaskStore
                 AND id IN (SELECT task_id FROM {$this->m_dependencyTable} WHERE depends_on_id = $1)
             SQL;
 
-        $this->m_connection->queryWithParams($query, [$succeededId]);
+        $this->m_connection->query($query, [$succeededId]);
     }
 
 
@@ -877,7 +877,7 @@ final readonly class TaskStore
             SQL;
 
         $params = [$dead->getId(), $this->fetchNowAsText(), self::describeSkip($dead->getId(), $dead->getName())];
-        $this->m_connection->queryWithParams($query, $params);
+        $this->m_connection->query($query, $params);
     }
 
 
@@ -900,7 +900,7 @@ final readonly class TaskStore
                 WHERE id = $1
                 SQL;
 
-            $this->m_connection->queryWithParams($query, [$row['id'], $now, "{$what}, so it's being retried."]);
+            $this->m_connection->query($query, [$row['id'], $now, "{$what}, so it's being retried."]);
         }
         else
         {
@@ -914,7 +914,7 @@ final readonly class TaskStore
                 ? "{$what}, and it had no attempts left."
                 : "{$what}, so it was failed, as it may already have done what it does.";
 
-            $this->m_connection->queryWithParams($query, [$row['id'], $now, $reason]);
+            $this->m_connection->query($query, [$row['id'], $now, $reason]);
             $this->skipDependents($this->fetchTask((int)$row['id']));
         }
     }

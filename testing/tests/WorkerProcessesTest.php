@@ -170,7 +170,7 @@ $killedWorker = function () : void {
         // Make the retry finish quickly, rather than hanging again.
         $recordPayload = '{"label": "hangs", "behaviour": "record", "sleepMs": 0}';
         $update = 'UPDATE task_queue_test.task SET payload = $1 WHERE id = $2';
-        TestDatabase::get()->queryWithParams($update, [$recordPayload, $task->getId()]);
+        TestDatabase::get()->query($update, [$recordPayload, $task->getId()]);
 
         $second = startWorkerProcess($batch->getId(), 0.2);
         waitForWorkerProcess($second, 20);
