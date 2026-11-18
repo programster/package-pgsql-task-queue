@@ -16,12 +16,12 @@ use Programster\PgsqlTaskQueue\TaskHandlerInterface;
 
 
 /**
- * @extends AbstractReadonlyMap<TaskHandlerInterface>
+ * @extends AbstractReadonlyMap<TaskHandlerInterface, TaskHandlerEntry>
  */
 final readonly class TaskHandlerMap extends AbstractReadonlyMap
 {
-    public function __construct(TaskHandlerInterface ...$handlers)
+    public function __construct(TaskHandlerEntry ...$entries)
     {
-        parent::__construct(...$handlers);
+        parent::__construct(...$entries);
     }
 }

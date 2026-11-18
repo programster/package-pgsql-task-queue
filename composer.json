@@ -16,10 +16,9 @@
     "require": {
         "ext-pgsql": "*",
         "php": "^8.2",
-        "programster/collections": "^3.1",
-        "programster/pgsql-lib": "^3.1",
-        "psr/clock": "^1.0",
-        "ramsey/uuid": "^4.7"
+        "programster/collections": "^4.0",
+        "programster/pgsql-lib": "^3.2",
+        "psr/clock": "^1.0"
     },
     "require-dev": {
         "phpstan/phpstan": "^2.1"

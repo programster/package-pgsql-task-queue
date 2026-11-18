@@ -53,6 +53,9 @@ $rejected = function () : void {
         }
     };
 
+    $bracedId = '{019a8f2e-5c1b-7d3a-9e4f-0b6c2d8a1f37}';
+    $newlineId = "019a8f2e-5c1b-7d3a-9e4f-0b6c2d8a1f37\n";
+
     $bad = [
         'an empty type' => function () : void { Task::create('', []); },
         'a blank queue' => function () : void { Task::create('a', [], queue: ' '); },
@@ -64,6 +67,8 @@ $rejected = function () : void {
         'data that isn\'t JSON' => function () : void { Task::create('a', ['bad' => NAN]); },
         'a single value' => function () use ($singleValue) : void { Task::create('a', $singleValue); },
         'an ID that isn\'t a UUID' => function () : void { new TaskIdCollection('task-1'); },
+        'an ID in braces' => function () use ($bracedId) : void { new TaskIdCollection($bracedId); },
+        'an ID with a newline' => function () use ($newlineId) : void { new TaskIdCollection($newlineId); },
     ];
 
     foreach ($bad as $what => $create)

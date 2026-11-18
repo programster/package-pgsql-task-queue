@@ -34,6 +34,7 @@ namespace Programster\PgsqlTaskQueue;
 
 use Programster\PgsqlTaskQueue\Exceptions\ExceptionTaskFailed;
 use Programster\PgsqlTaskQueue\Exceptions\ExceptionTasksExpired;
+use Programster\PgsqlTaskQueue\Internal\TaskHandlerEntry;
 use Programster\PgsqlTaskQueue\Internal\TaskHandlerMap;
 use Programster\PgsqlTaskQueue\Internal\TaskStore;
 
@@ -44,6 +45,9 @@ final class Worker
 
     /** @var list<string> */
     private readonly array $m_queues;
+
+    /** @var list<string> - the types of task it has a handler for. */
+    private readonly array $m_handledTypes;
 
     // Each handler, by the type it handles.
     private readonly TaskHandlerMap $m_handlersByType;
@@ -82,21 +86,24 @@ final class Worker
             $queueNames[] = $name;
         }
 
-        $handlersByType = [];
+        $handledTypes = [];
+        $handlerEntries = [];
 
         foreach ($handlers as $handler)
         {
-            if (isset($handlersByType[$handler->getType()]))
+            if (in_array($handler->getType(), $handledTypes, true))
             {
                 throw new \InvalidArgumentException("Two handlers handle the {$handler->getType()} type of task.");
             }
 
-            $handlersByType[$handler->getType()] = $handler;
+            $handledTypes[] = $handler->getType();
+            $handlerEntries[] = TaskHandlerEntry::createUsingHandler($handler);
         }
 
         $this->m_store = $queue->getStore();
         $this->m_queues = $queueNames;
-        $this->m_handlersByType = new TaskHandlerMap(...$handlersByType);
+        $this->m_handledTypes = $handledTypes;
+        $this->m_handlersByType = new TaskHandlerMap(...$handlerEntries);
         $this->m_name = sprintf('%s:%d:%s', gethostname(), getmypid(), bin2hex(random_bytes(4)));
     }
 
@@ -120,7 +127,7 @@ final class Worker
     public function runNext() : bool
     {
         $this->m_store->removeAllExpired();
-        $claimed = $this->m_store->claimNext($this->m_queues, $this->m_handlersByType->keys(), $this->m_name);
+        $claimed = $this->m_store->claimNext($this->m_queues, $this->m_handledTypes, $this->m_name);
 
         foreach ($claimed as $task)
         {

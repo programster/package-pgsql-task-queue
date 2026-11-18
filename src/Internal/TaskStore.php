@@ -17,6 +17,8 @@ namespace Programster\PgsqlTaskQueue\Internal;
 
 
 use Programster\PgsqlLib\PgSqlConnection;
+use Programster\PgsqlLib\PgsqlLib;
+use Programster\PgsqlLib\UuidVersion;
 use Programster\PgsqlTaskQueue\DependencyFailurePolicy;
 use Programster\PgsqlTaskQueue\Exceptions\ExceptionTaskNotFound;
 use Programster\PgsqlTaskQueue\Exceptions\ExceptionTasksExpired;
@@ -25,7 +27,6 @@ use Programster\PgsqlTaskQueue\ExpiredTaskCollection;
 use Programster\PgsqlTaskQueue\Task;
 use Programster\PgsqlTaskQueue\TaskCollection;
 use Psr\Clock\ClockInterface;
-use Ramsey\Uuid\Uuid;
 
 
 final readonly class TaskStore
@@ -98,7 +99,7 @@ final readonly class TaskStore
     {
         $ordered = self::orderDependenciesFirst($tasks);
 
-        $insertAll = function () use ($ordered) : array {
+        $insertAll = function () use ($tasks, $ordered) : TaskCollection {
             $addedByObject = [];
             $newIdsByOldId = [];
 
@@ -126,18 +127,17 @@ final readonly class TaskStore
             }
 
             $this->notify();
-            return $addedByObject;
+            $inGivenOrder = [];
+
+            foreach ($tasks as $task)
+            {
+                $inGivenOrder[] = $addedByObject[spl_object_id($task)];
+            }
+
+            return new TaskCollection(...$inGivenOrder);
         };
 
-        $addedByObject = $this->inTransaction($insertAll);
-        $inGivenOrder = [];
-
-        foreach ($tasks as $task)
-        {
-            $inGivenOrder[] = $addedByObject[spl_object_id($task)];
-        }
-
-        return new TaskCollection(...$inGivenOrder);
+        return $this->inTransaction($insertAll);
     }
 
 
@@ -320,7 +320,7 @@ final readonly class TaskStore
 
     public function fetch(string $id) : Task
     {
-        if (!Uuid::isValid($id))
+        if (!PgsqlLib::isValidUuid($id))
         {
             throw new ExceptionTaskNotFound("There's no task \"{$id}\" in the queue, as that isn't a task's ID.");
         }
@@ -454,11 +454,11 @@ final readonly class TaskStore
      *
      * @param TaskCollection $tasks
      *
-     * @return list<Task>
+     * @return TaskCollection
      *
      * @throws \LogicException - if a task depends on one that isn't queued, and isn't among them.
      */
-    private static function orderDependenciesFirst(TaskCollection $tasks) : array
+    private static function orderDependenciesFirst(TaskCollection $tasks) : TaskCollection
     {
         $isGiven = [];
         $byOldId = [];
@@ -512,7 +512,7 @@ final readonly class TaskStore
             $addInOrder($task);
         }
 
-        return $ordered;
+        return new TaskCollection(...$ordered);
     }
 
 
@@ -562,7 +562,7 @@ final readonly class TaskStore
             $task->getLeaseSeconds(),
             $task->getOnDependencyFailure(),
             SqlValues::formatTimestamp($now),
-            Uuid::uuid7()->toString(),
+            PgsqlLib::generateUuid(UuidVersion::V7),
         ];
 
         $row = pg_fetch_assoc($this->m_connection->query($insertQuery, $params));

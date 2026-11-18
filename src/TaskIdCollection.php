@@ -12,7 +12,7 @@ namespace Programster\PgsqlTaskQueue;
 
 
 use Programster\Collections\AbstractReadonlyCollection;
-use Ramsey\Uuid\Uuid;
+use Programster\PgsqlLib\PgsqlLib;
 
 
 /**
@@ -30,7 +30,7 @@ final readonly class TaskIdCollection extends AbstractReadonlyCollection
 
         foreach ($ids as $id)
         {
-            if (!Uuid::isValid($id))
+            if (!PgsqlLib::isValidUuid($id))
             {
                 throw new \InvalidArgumentException("A task's ID is a UUID, not \"{$id}\".");
             }

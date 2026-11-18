@@ -1,5 +1,15 @@
 # Upgrading
 
+## 1.0.0-alpha6
+- No longer needs `ramsey/uuid` (or, through it, `ramsey/collection` and `brick/math`). Task IDs are generated with
+  `programster/pgsql-lib`'s `PgsqlLib::generateUuid()` instead, so it now needs `programster/pgsql-lib` 3.2 or later.
+- Needs `programster/collections` 4.0, rather than 3.x. Nothing changes for the collections this package gives you
+  (`TaskCollection`, `TaskIdCollection` and `ExpiredTaskCollection`), but if your application uses
+  `programster/collections` maps of its own, see its upgrade notes.
+- `TaskIdCollection` (and `TaskQueue::fetch()`) only accept an ID in its usual form, e.g.
+  `019a8f2e-5c1b-7d3a-9e4f-0b6c2d8a1f37`, in either case. Before, an ID in braces or with a `urn:uuid:` prefix was
+  accepted, and then never matched a task.
+
 ## 1.0.0-alpha4
 - Fixes `fetchWithData($type, [])`, which didn't find the tasks of the type whose data is empty, or a list (as `{}`,
   which it looked for, isn't contained in a list). An empty array now matches every task of the type, as documented.
